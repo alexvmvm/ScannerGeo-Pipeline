@@ -1,0 +1,26 @@
+{
+  "Recon": {
+    "MaxUploadFileCount": 100,
+    "MaxUploadFileSizeBytes": 26214400,
+    "MaxUploadRequestBodySizeBytes": 524288000,
+    "MaxImportUrlCount": 100,
+    "MinimumValidImageCount": 3,
+    "MaxImportDownloadBytes": 52428800,
+    "ImportTimeoutSeconds": 15,
+    "MaxRedirects": 3,
+    "AllowedExtensions": [ ".jpg", ".jpeg", ".png", ".tif", ".tiff" ],
+    "ObjectStorageProvider": "Minio",
+    "ObjectStorageBucket": "recon",
+    "ObjectStorageEndpoint": "http://minio:9000",
+    "ObjectStorageAccessKey": "minioadmin",
+    "ObjectStorageSecretKey": "minioadmin",
+    "ObjectStorageUseSsl": false,
+    "PipelineProvider": "Simulated",
+    "ColmapBinaryPath": "colmap",
+    "ColmapUseGpu": false,
+    "WorkerIdlePollSeconds": 5,
+    "StorageRootPath": "/var/recon/storage",
+    "ScratchRootPath": "/tmp/recon",
+    "PipelineVersion": "colmap"
+  }
+}

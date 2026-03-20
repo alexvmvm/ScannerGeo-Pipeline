@@ -1,0 +1,43 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+publish/
+
+# Test output
+TestResults/
+coverage/
+coverage-report/
+*.coverage
+*.coveragexml
+*.trx
+
+# IDE and editor state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userprefs
+*.rsuser
+
+# Package restore
+packages/
+!.config/dotnet-tools.json
+
+# Logs
+logs/
+*.log
+
+# Environment and local overrides
+.env
+.env.*
+!.env.example
+reconsettings.Local.json
+reconsettings.*.local.json
+appsettings.Local.json
+appsettings.*.local.json
+
+# OS files
+.DS_Store
+Thumbs.db

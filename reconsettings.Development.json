@@ -1,0 +1,9 @@
+{
+  "Recon": {
+    "ObjectStorageEndpoint": "http://localhost:9000",
+    "ObjectStorageAccessKey": "minioadmin",
+    "ObjectStorageSecretKey": "minioadmin",
+    "StorageRootPath": "../../.data/storage",
+    "ScratchRootPath": "../../.data/scratch"
+  }
+}

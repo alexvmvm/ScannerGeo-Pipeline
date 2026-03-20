@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-Recon.Worker-3aa3e067-f87e-4ac0-854f-ec3aa75e8002</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\reconsettings.json" Link="reconsettings.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\reconsettings.Development.json" Link="reconsettings.Development.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\reconsettings.Docker.json" Link="reconsettings.Docker.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Settings.Configuration" Version="8.0.4" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="5.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Recon.Core\Recon.Core.csproj" />
+    <ProjectReference Include="..\Recon.Infrastructure\Recon.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>
