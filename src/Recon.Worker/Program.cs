@@ -34,4 +34,5 @@ static void AddSharedReconConfig(ConfigurationManager configuration, string cont
     configuration.AddJsonFile($"reconsettings.{environmentName}.json", optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, "reconsettings.json"), optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, $"reconsettings.{environmentName}.json"), optional: true, reloadOnChange: true);
+    configuration.AddEnvironmentVariables();
 }

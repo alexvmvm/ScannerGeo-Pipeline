@@ -64,13 +64,13 @@ app.UseExceptionHandler(errorApp =>
     errorApp.Run(async context =>
     {
         var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+        var isPayloadTooLarge = exception is not null && IsPayloadTooLarge(exception);
         var (status, title, extensions) = exception switch
         {
             NotFoundException => (StatusCodes.Status404NotFound, "Not Found", (IDictionary<string, object?>?)null),
             ConflictException => (StatusCodes.Status409Conflict, "Conflict", null),
             RequestValidationException validationException => (StatusCodes.Status400BadRequest, "Validation Failed", new Dictionary<string, object?> { ["errors"] = validationException.Errors }),
-            BadHttpRequestException badHttpRequestException when badHttpRequestException.StatusCode == StatusCodes.Status413PayloadTooLarge
-                => (StatusCodes.Status413PayloadTooLarge, "Payload Too Large", null),
+            _ when isPayloadTooLarge => (StatusCodes.Status413PayloadTooLarge, "Payload Too Large", null),
             _ => (StatusCodes.Status500InternalServerError, "Internal Server Error", null)
         };
 
@@ -81,8 +81,7 @@ app.UseExceptionHandler(errorApp =>
             Title = title,
             Detail = exception switch
             {
-                BadHttpRequestException badHttpRequestException when badHttpRequestException.StatusCode == StatusCodes.Status413PayloadTooLarge
-                    => $"The upload request exceeded the configured body limit of {uploadRequestBodyLimit} bytes.",
+                _ when isPayloadTooLarge => $"The upload request exceeded the configured body limit of {uploadRequestBodyLimit} bytes.",
                 null when status == 500 => "An unexpected error occurred.",
                 _ when status == 500 => "An unexpected error occurred.",
                 _ => exception?.Message ?? "An unexpected error occurred."
@@ -108,14 +107,7 @@ app.UseStaticFiles();
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ReconDbContext>();
-    if (db.Database.ProviderName?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true)
-    {
-        await db.Database.MigrateAsync();
-    }
-    else
-    {
-        await db.Database.EnsureCreatedAsync();
-    }
+    await DatabaseStartup.InitializeAsync(db);
 }
 
 if (app.Environment.IsDevelopment() || app.Environment.IsEnvironment("Docker"))
@@ -187,6 +179,14 @@ api.MapGet("/projects/{projectId:guid}", async (Guid projectId, ProjectService p
   .WithSummary("Get project")
   .WithDescription("Returns project metadata together with the latest run summary, image counts, and artifact count.");
 
+api.MapDelete("/projects/{projectId:guid}", async (Guid projectId, ProjectService projectService, CancellationToken ct) =>
+{
+    await projectService.DeleteProjectAsync(projectId, ct);
+    return Results.NoContent();
+}).WithTags("Projects")
+  .WithSummary("Delete project")
+  .WithDescription("Deletes the project together with its runs, jobs, images, artifacts, import state, and stored object content.");
+
 api.MapPost("/projects/{projectId:guid}/images", async (
     Guid projectId,
     HttpRequest request,
@@ -201,7 +201,19 @@ api.MapPost("/projects/{projectId:guid}/images", async (
         throw new RequestValidationException("Multipart form-data is required.", new Dictionary<string, string[]> { ["files"] = ["Multipart form-data is required."] });
     }
 
-    var form = await request.ReadFormAsync(ct);
+    IFormCollection form;
+    try
+    {
+        form = await request.ReadFormAsync(ct);
+    }
+    catch (Exception ex) when (IsPayloadTooLarge(ex))
+    {
+        return Results.Problem(
+            statusCode: StatusCodes.Status413PayloadTooLarge,
+            title: "Payload Too Large",
+            detail: $"The upload request exceeded the configured body limit of {uploadRequestBodyLimit} bytes.");
+    }
+
     var files = form.Files;
     if (files.Count == 0)
     {
@@ -508,6 +520,15 @@ static JobDetailsResponse ToJobDetailsResponse(Job job)
         job.StartedAtUtc,
         job.FinishedAtUtc);
 
+static bool IsPayloadTooLarge(Exception exception)
+    => exception switch
+    {
+        BadHttpRequestException badHttpRequestException when badHttpRequestException.StatusCode == StatusCodes.Status413PayloadTooLarge => true,
+        InvalidDataException invalidDataException when invalidDataException.Message.Contains("Multipart body length limit", StringComparison.OrdinalIgnoreCase) => true,
+        _ when exception.InnerException is not null => IsPayloadTooLarge(exception.InnerException),
+        _ => false
+    };
+
 static void AddSharedReconConfig(ConfigurationManager configuration, string contentRootPath, string environmentName)
 {
     var solutionRoot = Path.GetFullPath(Path.Combine(contentRootPath, "..", ".."));
@@ -515,6 +536,7 @@ static void AddSharedReconConfig(ConfigurationManager configuration, string cont
     configuration.AddJsonFile($"reconsettings.{environmentName}.json", optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, "reconsettings.json"), optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, $"reconsettings.{environmentName}.json"), optional: true, reloadOnChange: true);
+    configuration.AddEnvironmentVariables();
 }
 
 public partial class Program;

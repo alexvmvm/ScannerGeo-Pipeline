@@ -83,6 +83,32 @@ public sealed class FileSystemObjectStorage(IOptions<ReconOptions> options) : IO
     public Task<bool> ExistsAsync(string key, CancellationToken ct)
         => Task.FromResult(File.Exists(GetPath(key)));
 
+    public Task DeleteAsync(string key, CancellationToken ct)
+    {
+        var path = GetPath(key);
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+
+            var directory = Path.GetDirectoryName(path);
+            while (!string.IsNullOrWhiteSpace(directory) &&
+                   directory.StartsWith(_root, StringComparison.OrdinalIgnoreCase) &&
+                   Directory.Exists(directory) &&
+                   !Directory.EnumerateFileSystemEntries(directory).Any())
+            {
+                Directory.Delete(directory);
+                if (string.Equals(directory, _root, StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                directory = Path.GetDirectoryName(directory);
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
     private string GetPath(string key)
         => Path.Combine(_root, key.Replace('/', Path.DirectorySeparatorChar));
 
@@ -171,6 +197,19 @@ public sealed class MinioObjectStorage(IOptions<ReconOptions> options) : IObject
         catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound || ex.ErrorCode == "NoSuchKey")
         {
             return false;
+        }
+    }
+
+    public async Task DeleteAsync(string key, CancellationToken ct)
+    {
+        await EnsureBucketAsync(ct);
+
+        try
+        {
+            await _client.DeleteObjectAsync(_options.ObjectStorageBucket, key, ct);
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.NotFound || ex.ErrorCode == "NoSuchKey")
+        {
         }
     }
 

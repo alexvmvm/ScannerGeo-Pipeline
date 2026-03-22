@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Job Artifacts</title>
+<style>
+:root{--bg:#f3efe7;--panel:#fffdf8ee;--line:#d9d2c6;--ink:#1f2421;--muted:#5a655e;--accent:#1f6f5f;--soft:#d8ebe6;--ok:#235c48;--warn:#8e3b2f;--pending:#9d7f41}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#f8f4ec 0%,var(--bg) 100%);color:var(--ink);font-family:Georgia,"Times New Roman",serif}
+main{max-width:1380px;margin:0 auto;padding:24px 20px}
+h1,h2,p{margin:0}
+a{color:var(--accent)}
+.stack{display:grid;gap:18px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:0 14px 36px rgba(31,36,33,.06)}
+.panel-head{display:flex;justify-content:space-between;gap:12px;align-items:start;padding:18px 18px 12px}
+.panel-body{padding:0 18px 18px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.summary{display:inline-flex;align-items:center;min-height:40px;padding:8px 12px;border-radius:999px;background:var(--soft);color:var(--accent)}
+.status{color:var(--muted)} .status.success{color:var(--ok)} .status.error{color:var(--warn)}
+.subtle{color:var(--muted);font-size:.92rem}
+.grid4,.grid2{display:grid;gap:12px}
+.grid4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.grid2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.card,.detail{border:1px solid var(--line);border-radius:14px;background:#ffffffb8;padding:12px 14px}
+.card strong,.detail strong{display:block;margin-bottom:6px;font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.value{font-size:1.12rem}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px;background:#ffffffa8}
+table{width:100%;border-collapse:collapse;min-width:900px}
+thead th{padding:12px 10px;text-align:left;font-size:.76rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);border-bottom:1px solid var(--line);background:#faf7f0;position:sticky;top:0}
+tbody td{padding:12px 10px;border-top:1px solid rgba(217,210,198,.65);vertical-align:top}
+.badge,.state{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:.8rem}
+.badge{background:var(--soft);color:var(--accent)}
+.state.pending{background:#9d7f4122;color:var(--pending)}
+.state.available{background:#235c4822;color:var(--ok)}
+.state.failed{background:#8e3b2f22;color:var(--warn)}
+.state.superseded{background:#5a655e22;color:var(--muted)}
+.button-link{display:inline-flex;align-items:center;min-height:42px;padding:10px 14px;border-radius:999px;background:#e5ddd2;color:var(--ink);text-decoration:none}
+.empty{padding:24px 16px;border:1px dashed var(--line);border-radius:14px;text-align:center;color:var(--muted);background:#ffffff80}
+label.inline{display:inline-flex;align-items:center;gap:8px;color:var(--ink)}
+input[type=checkbox]{width:16px;height:16px}
+@media (max-width:1080px){.grid4,.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main class="stack">
+<section class="panel">
+<div class="panel-head">
+<div>
+<h1>Job Artifacts</h1>
+<p>Full artifact list for the selected job's pipeline run.</p>
+</div>
+<div class="row">
+<a class="button-link" href="/ops/jobs.html">Back To Ops</a>
+<div id="summaryPill" class="summary">Loading job...</div>
+</div>
+</div>
+<div class="panel-body stack">
+<div class="row">
+<div id="statusLine" class="status">Loading artifacts...</div>
+</div>
+<div id="jobCards" class="grid4"></div>
+<div id="artifactHint" class="detail">
+<strong>What You Are Seeing</strong>
+<div id="artifactHintText" class="subtle">Loading run artifacts...</div>
+</div>
+</div>
+</section>
+
+<section class="panel">
+<div class="panel-head">
+<div>
+<h2>Artifacts</h2>
+<p id="tableCaption">Matching artifacts for the selected job.</p>
+</div>
+</div>
+<div class="panel-body">
+<div id="artifactTableHost" class="empty">Loading artifacts...</div>
+</div>
+</section>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const summaryPill=$("summaryPill"),statusLine=$("statusLine"),jobCards=$("jobCards"),artifactHintText=$("artifactHintText"),tableCaption=$("tableCaption"),artifactTableHost=$("artifactTableHost");
+const params=new URLSearchParams(window.location.search);
+const jobId=params.get("jobId");
+let currentJob=null,runArtifacts=[],currentRun=null;
+
+function esc(v){return String(v).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")}
+function fmtDate(v){if(!v)return"None";const d=new Date(v);return Number.isNaN(d.getTime())?v:d.toLocaleString()}
+function fmtSize(v){if(v==null)return"Unknown";const units=["B","KB","MB","GB"];let size=v,unit=0;while(size>=1024&&unit<units.length-1){size/=1024;unit++}return `${size.toFixed(size>=10||unit===0?0:1)} ${units[unit]}`}
+function isSimulatedPipelineVersion(v){return !!v&&String(v).toLowerCase().includes("simulated")}
+function setStatus(message,state){statusLine.textContent=message;statusLine.className=state?`status ${state}`:"status"}
+async function readErr(r){try{const b=await r.json();return b.detail||b.title||`HTTP ${r.status}`}catch{return`HTTP ${r.status}`}}
+async function fetchJson(url){const r=await fetch(url,{headers:{Accept:"application/json"}});if(!r.ok)throw new Error(await readErr(r));return r.status===204?null:await r.json()}
+
+function renderJobCards(){
+  if(!currentJob){
+    jobCards.innerHTML="";
+    return;
+  }
+  jobCards.innerHTML=`<div class="card"><strong>Job Type</strong><div class="value">${esc(currentJob.type)}</div></div>
+  <div class="card"><strong>Status</strong><div class="value">${esc(currentJob.status)}</div></div>
+  <div class="card"><strong>Project</strong><div class="value">${esc(currentJob.projectId)}</div></div>
+  <div class="card"><strong>Run</strong><div class="value">${currentJob.pipelineRunId?esc(currentJob.pipelineRunId):"None"}</div></div>
+  <div class="detail"><strong>Started</strong>${esc(fmtDate(currentJob.startedAtUtc))}</div>
+  <div class="detail"><strong>Finished</strong>${esc(fmtDate(currentJob.finishedAtUtc))}</div>
+  <div class="detail"><strong>Attempts</strong>${currentJob.attemptCount}/${currentJob.maxAttempts}</div>
+  <div class="detail"><strong>Artifacts In Run</strong>${runArtifacts.length}</div>`;
+}
+
+function renderArtifactTable(){
+  if(!currentJob){
+    summaryPill.textContent="Missing job id";
+    artifactHintText.textContent="Open this page from a selected job in the ops screen.";
+    tableCaption.textContent="No job selected.";
+    artifactTableHost.className="empty";
+    artifactTableHost.textContent="A job id query parameter is required.";
+    return;
+  }
+  if(!currentJob.pipelineRunId){
+    summaryPill.textContent="No pipeline run";
+    artifactHintText.textContent="This job does not belong to a pipeline run, so there are no run artifacts to inspect here.";
+    tableCaption.textContent="This job has no associated pipeline run.";
+    artifactTableHost.className="empty";
+    artifactTableHost.textContent="Artifacts are only available for pipeline-run jobs.";
+    return;
+  }
+  const artifacts=runArtifacts;
+  summaryPill.textContent=`${artifacts.length} artifact${artifacts.length===1?"":"s"} shown`;
+  artifactHintText.textContent=isSimulatedPipelineVersion(currentRun&&currentRun.pipelineVersion)
+    ? `This run used the simulated pipeline (${currentRun.pipelineVersion}). The listed artifacts are placeholders, not real COLMAP outputs.`
+    : "Showing every artifact recorded for this pipeline run.";
+  tableCaption.textContent="Showing all artifacts for this run.";
+  if(artifacts.length===0){
+    artifactTableHost.className="empty";
+    artifactTableHost.textContent="No artifacts have been recorded for this run yet.";
+    return;
+  }
+  artifactTableHost.className="";
+  artifactTableHost.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Type</th><th>File</th><th>Status</th><th>Size</th><th>Created</th><th>Access</th></tr></thead><tbody>${artifacts.map(artifact=>`<tr><td><span class="badge">${esc(artifact.type)}</span></td><td><strong>${esc(artifact.fileName)}</strong><br><span class="subtle">${esc(artifact.mimeType)}</span></td><td><span class="state ${String(artifact.status).toLowerCase()}">${esc(artifact.status)}</span></td><td>${esc(fmtSize(artifact.fileSizeBytes))}</td><td>${esc(fmtDate(artifact.createdAtUtc))}</td><td><a href="/api/v1/projects/${encodeURIComponent(currentJob.projectId)}/artifacts/${encodeURIComponent(artifact.id)}" target="_blank" rel="noopener">Open / Download</a></td></tr>`).join("")}</tbody></table></div>`;
+}
+
+async function loadPage(){
+  try{
+    if(!jobId)throw new Error("Missing job id.");
+    currentJob=await fetchJson(`/api/v1/ops/jobs/${encodeURIComponent(jobId)}`);
+    if(currentJob.pipelineRunId){
+      const runDetails=await fetchJson(`/api/v1/projects/${encodeURIComponent(currentJob.projectId)}/runs/${encodeURIComponent(currentJob.pipelineRunId)}`);
+      currentRun=runDetails.run||null;
+      runArtifacts=Array.isArray(runDetails.artifacts)?runDetails.artifacts:[];
+    }else{
+      currentRun=null;
+      runArtifacts=[];
+    }
+    renderJobCards();
+    renderArtifactTable();
+    setStatus("Loaded job artifacts.","success");
+  }catch(error){
+    summaryPill.textContent="Load failed";
+    artifactHintText.textContent="The job or its artifacts could not be loaded.";
+    artifactTableHost.className="empty";
+    artifactTableHost.textContent=error.message||"Load failed.";
+    setStatus(error.message||"Load failed.","error");
+  }
+}
+loadPage();
+</script>
+</body>
+</html>

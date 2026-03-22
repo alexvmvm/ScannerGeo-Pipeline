@@ -26,12 +26,24 @@ services:
     build:
       context: .
       dockerfile: src/Recon.Api/Dockerfile
+      args:
+        INSTALL_COLMAP: ${RECON_INSTALL_COLMAP:-false}
+        COLMAP_REF: ${RECON_COLMAP_REF:-3.13.0}
+        COLMAP_CUDA_ARCHITECTURES: "${RECON_COLMAP_CUDA_ARCHITECTURES:-75;80;86;89}"
     depends_on:
       - postgres
       - minio
     environment:
       ASPNETCORE_ENVIRONMENT: Docker
       ConnectionStrings__ReconDb: ${RECON_DB:-Host=postgres;Port=5432;Database=recon;Username=postgres;Password=postgres}
+      Recon__PipelineProvider: ${RECON_PIPELINE_PROVIDER:-Simulated}
+      Recon__ColmapBinaryPath: ${RECON_COLMAP_BINARY_PATH:-colmap}
+      Recon__ColmapUseGpu: ${RECON_COLMAP_USE_GPU:-true}
+      Recon__StorageRootPath: ${RECON_STORAGE_ROOT:-/var/recon/storage}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      XDG_RUNTIME_DIR: /tmp/runtime-root
+    gpus: all
     ports:
       - "8080:8080"
     volumes:
@@ -41,12 +53,25 @@ services:
     build:
       context: .
       dockerfile: src/Recon.Worker/Dockerfile
+      args:
+        INSTALL_COLMAP: ${RECON_INSTALL_COLMAP:-false}
+        COLMAP_REF: ${RECON_COLMAP_REF:-3.13.0}
+        COLMAP_CUDA_ARCHITECTURES: "${RECON_COLMAP_CUDA_ARCHITECTURES:-75;80;86;89}"
     depends_on:
       - postgres
       - minio
     environment:
       DOTNET_ENVIRONMENT: Docker
       ConnectionStrings__ReconDb: ${RECON_DB:-Host=postgres;Port=5432;Database=recon;Username=postgres;Password=postgres}
+      Recon__PipelineProvider: ${RECON_PIPELINE_PROVIDER:-Simulated}
+      Recon__ColmapBinaryPath: ${RECON_COLMAP_BINARY_PATH:-colmap}
+      Recon__ColmapUseGpu: ${RECON_COLMAP_USE_GPU:-true}
+      Recon__StorageRootPath: ${RECON_STORAGE_ROOT:-/var/recon/storage}
+      Recon__ScratchRootPath: ${RECON_SCRATCH_ROOT:-/tmp/recon}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+      XDG_RUNTIME_DIR: /tmp/runtime-root
+    gpus: all
     volumes:
       - recon-storage:/var/recon/storage
 

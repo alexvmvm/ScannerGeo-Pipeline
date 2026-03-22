@@ -64,7 +64,8 @@ public sealed class ProjectService(
     IReconDbContext dbContext,
     IClock clock,
     ProjectStatusService statusService,
-    IOptions<ReconOptions> options)
+    IOptions<ReconOptions> options,
+    IObjectStorage objectStorage)
 {
     private readonly ReconOptions _options = options.Value;
 
@@ -155,6 +156,68 @@ public sealed class ProjectService(
         project.Status = statusService.DetermineReadyStatus(project, validImageCount, _options.MinimumValidImageCount);
         project.UpdatedAtUtc = clock.UtcNow;
         await dbContext.SaveChangesAsync(ct);
+    }
+
+    public async Task DeleteProjectAsync(Guid projectId, CancellationToken ct)
+    {
+        var project = await dbContext.Projects.FirstOrDefaultAsync(x => x.Id == projectId, ct)
+            ?? throw new NotFoundException($"Project '{projectId}' was not found.");
+        var hasActiveJobs = await dbContext.Jobs.AnyAsync(
+            x => x.ProjectId == projectId &&
+                 (x.Status == JobStatus.Queued || x.Status == JobStatus.Running || x.Status == JobStatus.RetryScheduled),
+            ct);
+        if (hasActiveJobs)
+        {
+            throw new ConflictException("The project has active jobs. Wait for them to finish before deleting the project.");
+        }
+
+        var runs = await dbContext.PipelineRuns.Where(x => x.ProjectId == projectId).ToListAsync(ct);
+        var runIds = runs.Select(x => x.Id).ToArray();
+
+        var importBatches = await dbContext.ImportBatches.Where(x => x.ProjectId == projectId).ToListAsync(ct);
+        var importBatchIds = importBatches.Select(x => x.Id).ToArray();
+        var importBatchItems = importBatchIds.Length == 0
+            ? []
+            : await dbContext.ImportBatchItems.Where(x => importBatchIds.Contains(x.ImportBatchId)).ToListAsync(ct);
+
+        var jobs = await dbContext.Jobs.Where(x => x.ProjectId == projectId).ToListAsync(ct);
+        var stageReports = runIds.Length == 0
+            ? []
+            : await dbContext.StageReports.Where(x => x.ProjectId == projectId || runIds.Contains(x.PipelineRunId)).ToListAsync(ct);
+        var artifacts = await dbContext.Artifacts.Where(x => x.ProjectId == projectId).ToListAsync(ct);
+        var images = await dbContext.ProjectImages.Where(x => x.ProjectId == projectId).ToListAsync(ct);
+
+        var storageKeys = artifacts.Select(x => x.StorageKey)
+            .Concat(images.Select(x => x.StorageKey))
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        foreach (var key in storageKeys)
+        {
+            await objectStorage.DeleteAsync(key, ct);
+        }
+
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(ct);
+        dbContext.StageReports.RemoveRange(stageReports);
+        dbContext.Jobs.RemoveRange(jobs);
+        dbContext.Artifacts.RemoveRange(artifacts);
+        dbContext.ProjectImages.RemoveRange(images);
+        dbContext.ImportBatchItems.RemoveRange(importBatchItems);
+        dbContext.ImportBatches.RemoveRange(importBatches);
+        dbContext.PipelineRuns.RemoveRange(runs);
+        dbContext.Projects.Remove(project);
+        await dbContext.SaveChangesAsync(ct);
+        await transaction.CommitAsync(ct);
+
+        foreach (var runId in runIds)
+        {
+            var scratchPath = Path.Combine(_options.ScratchRootPath, runId.ToString("N"));
+            if (Directory.Exists(scratchPath))
+            {
+                Directory.Delete(scratchPath, recursive: true);
+            }
+        }
     }
 }
 

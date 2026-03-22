@@ -142,19 +142,19 @@ public sealed class SimulatedProjectPipelineService : IProjectPipelineService
     public Task<PipelineExecutionResult> RunSparseAsync(ProjectPipelineContext context, CancellationToken ct)
         => Task.FromResult(CreateResult(context, PipelineStage.Sparse,
         [
-            new PipelineArtifact("model.bin", "application/octet-stream", Encoding.UTF8.GetBytes("sparse-model"), ArtifactType.SparseModel, "{}")
+            new PipelineArtifact("model.bin", "application/octet-stream", CreateSimulatedSparsePlaceholderBytes(), ArtifactType.SparseModel, "{\"simulated\":true}")
         ]));
 
     public Task<PipelineExecutionResult> RunDenseAsync(ProjectPipelineContext context, CancellationToken ct)
         => Task.FromResult(CreateResult(context, PipelineStage.Dense,
         [
-            new PipelineArtifact("fused.ply", "application/octet-stream", Encoding.UTF8.GetBytes("dense-point-cloud"), ArtifactType.DensePointCloud, "{}")
+            new PipelineArtifact("fused.ply", "application/octet-stream", CreateSimulatedDensePlaceholderBytes(context), ArtifactType.DensePointCloud, "{\"simulated\":true,\"format\":\"ply\"}")
         ]));
 
     public Task<PipelineExecutionResult> RunExportAsync(ProjectPipelineContext context, CancellationToken ct)
         => Task.FromResult(CreateResult(context, PipelineStage.Export,
         [
-            new PipelineArtifact("viewer.zip", "application/zip", Encoding.UTF8.GetBytes("potree-package"), ArtifactType.PotreePackage, "{}")
+            new PipelineArtifact("viewer.zip", "application/zip", CreateSimulatedExportPlaceholderBytes(), ArtifactType.PotreePackage, "{\"simulated\":true}")
         ]));
 
     private static PipelineExecutionResult CreateResult(ProjectPipelineContext context, PipelineStage stage, IReadOnlyCollection<PipelineArtifact> artifacts)
@@ -164,12 +164,32 @@ public sealed class SimulatedProjectPipelineService : IProjectPipelineService
             projectId = context.Project.Id,
             runId = context.Run.Id,
             stage,
+            simulated = true,
             imageCount = context.Images.Count,
             generatedAtUtc = DateTimeOffset.UtcNow
         }, ReconJson.Defaults);
 
         return new PipelineExecutionResult(true, reportJson, artifacts);
     }
+
+    private static byte[] CreateSimulatedSparsePlaceholderBytes()
+        => Encoding.UTF8.GetBytes("SIMULATED sparse model placeholder. Configure Recon:PipelineProvider=Colmap for real reconstruction output.\n");
+
+    private static byte[] CreateSimulatedDensePlaceholderBytes(ProjectPipelineContext context)
+        => Encoding.UTF8.GetBytes(
+            "ply\n" +
+            "format ascii 1.0\n" +
+            "comment SIMULATED placeholder output\n" +
+            $"comment project {context.Project.Id}\n" +
+            $"comment run {context.Run.Id}\n" +
+            "element vertex 0\n" +
+            "property float x\n" +
+            "property float y\n" +
+            "property float z\n" +
+            "end_header\n");
+
+    private static byte[] CreateSimulatedExportPlaceholderBytes()
+        => Encoding.UTF8.GetBytes("SIMULATED export placeholder. Configure Recon:PipelineProvider=Colmap for real export output.\n");
 }
 
 public static class DependencyInjection
@@ -199,6 +219,7 @@ public static class DependencyInjection
         services.AddSingleton<IUrlImportSecurityValidator, UrlImportSecurityValidator>();
         services.AddSingleton<IImageInspector, ImageSharpInspector>();
         services.AddSingleton<IProcessRunner, ProcessRunner>();
+        services.AddSingleton<ColmapRuntimeValidator>();
         services.AddScoped<IProjectPipelineService>(sp =>
         {
             var options = sp.GetRequiredService<IOptions<ReconOptions>>();

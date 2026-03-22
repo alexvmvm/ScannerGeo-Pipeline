@@ -25,6 +25,13 @@ public sealed class ProcessRunner : IProcessRunner
             WorkingDirectory = workingDirectory
         };
 
+        // COLMAP's GPU feature extractor still initializes Qt. Force a headless
+        // platform plugin so worker containers do not require an X display.
+        if (!startInfo.Environment.ContainsKey("QT_QPA_PLATFORM"))
+        {
+            startInfo.Environment["QT_QPA_PLATFORM"] = "offscreen";
+        }
+
         foreach (var argument in arguments)
         {
             startInfo.ArgumentList.Add(argument);
@@ -74,7 +81,7 @@ public sealed class ColmapProjectPipelineService(
             "feature_extractor",
             "--database_path", databasePath,
             "--image_path", workspace.ImagesDirectory,
-            "--SiftExtraction.use_gpu", _options.ColmapUseGpu ? "1" : "0"
+            "--FeatureExtraction.use_gpu", _options.ColmapUseGpu ? "1" : "0"
         ], workspace.WorkRoot, ct));
 
         var matcherCommand = ResolveMatcherCommand(context.Project.ConfigJson);
@@ -82,7 +89,7 @@ public sealed class ColmapProjectPipelineService(
         [
             matcherCommand,
             "--database_path", databasePath,
-            "--SiftMatching.use_gpu", _options.ColmapUseGpu ? "1" : "0"
+            "--FeatureMatching.use_gpu", _options.ColmapUseGpu ? "1" : "0"
         ], workspace.WorkRoot, ct));
 
         commands.Add(await RunRequiredAsync(

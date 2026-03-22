@@ -52,6 +52,7 @@ public interface IObjectStorage
     Task SaveAsync(string key, Stream content, string contentType, CancellationToken ct);
     Task<StoredObject?> OpenReadAsync(string key, CancellationToken ct);
     Task<bool> ExistsAsync(string key, CancellationToken ct);
+    Task DeleteAsync(string key, CancellationToken ct);
 }
 
 public sealed record ImageInspectionResult(
