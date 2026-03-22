@@ -3,7 +3,11 @@
     "ObjectStorageEndpoint": "http://localhost:9000",
     "ObjectStorageAccessKey": "minioadmin",
     "ObjectStorageSecretKey": "minioadmin",
+    "PipelineProvider": "Colmap",
+    "ColmapBinaryPath": "colmap",
+    "ColmapUseGpu": true,
     "StorageRootPath": "../../.data/storage",
-    "ScratchRootPath": "../../.data/scratch"
+    "ScratchRootPath": "../../.data/scratch",
+    "PipelineVersion": "colmap"
   }
 }

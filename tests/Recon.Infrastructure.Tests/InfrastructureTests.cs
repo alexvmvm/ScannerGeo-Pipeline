@@ -184,8 +184,85 @@ public sealed class InfrastructureTests
         scope.ServiceProvider.GetRequiredService<IProjectPipelineService>().Should().BeOfType<SimulatedProjectPipelineService>();
     }
 
+    [Fact]
+    public async Task ColmapRuntimeValidator_SkipsCheck_WhenPipelineIsSimulated()
+    {
+        var runner = new RecordingProcessRunner();
+        var validator = new ColmapRuntimeValidator(
+            Options.Create(new ReconOptions
+            {
+                PipelineProvider = "Simulated",
+                ColmapBinaryPath = "colmap",
+                ScratchRootPath = Path.GetTempPath()
+            }),
+            runner);
+
+        await validator.ValidateAsync(CancellationToken.None);
+
+        runner.CallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ColmapRuntimeValidator_ThrowsHelpfulError_WhenColmapCannotStart()
+    {
+        var validator = new ColmapRuntimeValidator(
+            Options.Create(new ReconOptions
+            {
+                PipelineProvider = "Colmap",
+                ColmapBinaryPath = "missing-colmap",
+                ScratchRootPath = Path.GetTempPath()
+            }),
+            new ThrowingProcessRunner(new FileNotFoundException("not found")));
+
+        var action = () => validator.ValidateAsync(CancellationToken.None);
+
+        await action.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*COLMAP mode is enabled*missing-colmap*Simulated*");
+    }
+
+    [Fact]
+    public async Task ColmapRuntimeValidator_RunsHelpCheck_WhenPipelineIsColmap()
+    {
+        var runner = new RecordingProcessRunner();
+        var validator = new ColmapRuntimeValidator(
+            Options.Create(new ReconOptions
+            {
+                PipelineProvider = "Colmap",
+                ColmapBinaryPath = "colmap",
+                ScratchRootPath = Path.GetTempPath()
+            }),
+            runner);
+
+        await validator.ValidateAsync(CancellationToken.None);
+
+        runner.CallCount.Should().Be(1);
+        runner.FileName.Should().Be("colmap");
+        runner.Arguments.Should().Equal("--help");
+    }
+
     private sealed class StaticClock : IClock
     {
         public DateTimeOffset UtcNow => new(2026, 3, 19, 12, 0, 0, TimeSpan.Zero);
+    }
+
+    private sealed class RecordingProcessRunner : IProcessRunner
+    {
+        public int CallCount { get; private set; }
+        public string? FileName { get; private set; }
+        public IReadOnlyCollection<string> Arguments { get; private set; } = [];
+
+        public Task<ProcessExecutionResult> RunAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+        {
+            CallCount++;
+            FileName = fileName;
+            Arguments = arguments;
+            return Task.FromResult(new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero));
+        }
+    }
+
+    private sealed class ThrowingProcessRunner(Exception exception) : IProcessRunner
+    {
+        public Task<ProcessExecutionResult> RunAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+            => throw exception;
     }
 }

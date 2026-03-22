@@ -14,14 +14,10 @@ public sealed class Worker(IServiceScopeFactory scopeFactory, IOptions<ReconOpti
         using (var startupScope = scopeFactory.CreateScope())
         {
             var startupDbContext = startupScope.ServiceProvider.GetRequiredService<ReconDbContext>();
-            if (startupDbContext.Database.ProviderName?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true)
-            {
-                await startupDbContext.Database.MigrateAsync(stoppingToken);
-            }
-            else
-            {
-                await startupDbContext.Database.EnsureCreatedAsync(stoppingToken);
-            }
+            var colmapRuntimeValidator = startupScope.ServiceProvider.GetRequiredService<ColmapRuntimeValidator>();
+            await DatabaseStartup.InitializeAsync(startupDbContext, stoppingToken);
+
+            await colmapRuntimeValidator.ValidateAsync(stoppingToken);
         }
 
         while (!stoppingToken.IsCancellationRequested)
