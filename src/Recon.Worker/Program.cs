@@ -30,9 +30,18 @@ await host.RunAsync();
 static void AddSharedReconConfig(ConfigurationManager configuration, string contentRootPath, string environmentName)
 {
     var solutionRoot = Path.GetFullPath(Path.Combine(contentRootPath, "..", ".."));
+    var defaultOctreeProjectPath = Path.Combine(solutionRoot, "external", "ScannerGeo-Octree", "src", "OctreeBuild.Cli", "OctreeBuild.Cli.csproj");
     configuration.AddJsonFile("reconsettings.json", optional: true, reloadOnChange: true);
     configuration.AddJsonFile($"reconsettings.{environmentName}.json", optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, "reconsettings.json"), optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, $"reconsettings.{environmentName}.json"), optional: true, reloadOnChange: true);
+    if (File.Exists(defaultOctreeProjectPath))
+    {
+        configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Recon:OctreeCliProjectPath"] = defaultOctreeProjectPath
+        });
+    }
+
     configuration.AddEnvironmentVariables();
 }

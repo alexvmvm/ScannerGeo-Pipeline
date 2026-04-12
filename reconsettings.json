@@ -21,6 +21,6 @@
     "WorkerIdlePollSeconds": 5,
     "StorageRootPath": "/var/recon/storage",
     "ScratchRootPath": "/tmp/recon",
-    "PipelineVersion": "colmap"
+    "PipelineVersion": "colmap-octree"
   }
 }

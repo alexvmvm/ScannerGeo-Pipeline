@@ -3,10 +3,13 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Recon.Core;
 using Recon.Domain;
 using Recon.Infrastructure;
+using System.IO.Compression;
+using System.Text.Json;
 
 namespace Recon.Infrastructure.Tests;
 
@@ -59,6 +62,8 @@ public sealed class InfrastructureTests
         var imageId = Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
         var key = factory.GetOriginalImageKey(projectId, imageId, "scan 01.jpg");
         key.Should().Be("projects/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/images/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb/original/scan_01.jpg");
+        factory.GetExportOutputKey(projectId, Guid.Parse("cccccccc-cccc-cccc-cccc-cccccccccccc"), "scene package.zip")
+            .Should().Be("projects/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/runs/cccccccc-cccc-cccc-cccc-cccccccccccc/export/scene_package.zip");
     }
 
     [Theory]
@@ -240,6 +245,115 @@ public sealed class InfrastructureTests
         runner.Arguments.Should().Equal("--help");
     }
 
+    [Fact]
+    public async Task ColmapPipeline_PublishBuildsOctreeScenePackage_FromLatestDenseArtifact()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = new ReconDbContext(new DbContextOptionsBuilder<ReconDbContext>().UseSqlite(connection).Options);
+        await db.Database.EnsureCreatedAsync();
+
+        var root = Path.Combine(Path.GetTempPath(), "recon-octree-export-tests", Guid.NewGuid().ToString("N"));
+        var storageRoot = Path.Combine(root, "storage");
+        var scratchRoot = Path.Combine(root, "scratch");
+        Directory.CreateDirectory(storageRoot);
+        Directory.CreateDirectory(scratchRoot);
+
+        try
+        {
+            var project = new Project
+            {
+                Id = Guid.NewGuid(),
+                Name = "Octree export",
+                Status = ProjectStatus.ReadyForProcessing,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                UpdatedAtUtc = DateTimeOffset.UtcNow
+            };
+            var previousRun = new PipelineRun
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                Status = PipelineRunStatus.Succeeded,
+                PipelineVersion = "colmap-octree",
+                CreatedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-10),
+                UpdatedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-10),
+                FinishedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-9)
+            };
+            var run = new PipelineRun
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                Status = PipelineRunStatus.Running,
+                PipelineVersion = "colmap-octree",
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                UpdatedAtUtc = DateTimeOffset.UtcNow
+            };
+
+            db.Projects.Add(project);
+            db.PipelineRuns.Add(previousRun);
+            db.PipelineRuns.Add(run);
+
+            var storage = new FileSystemObjectStorage(Options.Create(new ReconOptions { StorageRootPath = storageRoot }));
+            const string denseKey = "projects/test/runs/test/dense/fused.ply";
+            await storage.SaveAsync(denseKey, new MemoryStream("ply\nend_header\n"u8.ToArray()), "application/octet-stream", CancellationToken.None);
+
+            db.Artifacts.Add(new Artifact
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                PipelineRunId = previousRun.Id,
+                Type = ArtifactType.DensePointCloud,
+                Status = ArtifactStatus.Available,
+                StorageKey = denseKey,
+                FileName = "fused.ply",
+                MimeType = "application/octet-stream",
+                FileSizeBytes = 15,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                UpdatedAtUtc = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+
+            var runner = new OctreeExportProcessRunner();
+            var pipeline = new ColmapProjectPipelineService(
+                storage,
+                db,
+                runner,
+                Options.Create(new ReconOptions
+                {
+                    ScratchRootPath = scratchRoot,
+                    ColmapBinaryPath = "colmap",
+                    OctreeCliProjectPath = Path.Combine("external", "ScannerGeo-Octree", "src", "OctreeBuild.Cli", "OctreeBuild.Cli.csproj")
+                }),
+                NullLogger<ColmapProjectPipelineService>.Instance);
+
+            var result = await pipeline.RunPublishAsync(new ProjectPipelineContext(project, run, [], Path.Combine(scratchRoot, run.Id.ToString("N"))), CancellationToken.None);
+
+            result.Artifacts.Should().ContainSingle();
+            var artifact = result.Artifacts.Single();
+            artifact.ArtifactType.Should().Be(ArtifactType.OctreePackage);
+            artifact.FileName.Should().Be("octree-scene-package.zip");
+
+            using var archive = new ZipArchive(new MemoryStream(artifact.Bytes), ZipArchiveMode.Read);
+            archive.Entries.Select(x => x.FullName).Should().Contain("scene/manifest.json");
+            archive.Entries.Select(x => x.FullName).Should().Contain("scene/nodes/r.bin");
+
+            runner.FileName.Should().Be("dotnet");
+            runner.Arguments.Should().Contain("run");
+            runner.Arguments.Should().Contain("--project");
+            runner.Arguments.Should().Contain(Path.GetFullPath(Path.Combine("external", "ScannerGeo-Octree", "src", "OctreeBuild.Cli", "OctreeBuild.Cli.csproj")));
+            result.ReportJson.Should().Contain(previousRun.Id.ToString());
+            result.ReportJson.Should().Contain("run-");
+            artifact.MetadataJson.Should().Contain("scannergeo-octree-scene");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private sealed class StaticClock : IClock
     {
         public DateTimeOffset UtcNow => new(2026, 3, 19, 12, 0, 0, TimeSpan.Zero);
@@ -264,5 +378,52 @@ public sealed class InfrastructureTests
     {
         public Task<ProcessExecutionResult> RunAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
             => throw exception;
+    }
+
+    private sealed class OctreeExportProcessRunner : IProcessRunner
+    {
+        public string? FileName { get; private set; }
+        public IReadOnlyCollection<string> Arguments { get; private set; } = [];
+
+        public async Task<ProcessExecutionResult> RunAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+        {
+            FileName = fileName;
+            Arguments = arguments.ToArray();
+
+            var args = arguments.ToArray();
+            var outputPath = args[Array.IndexOf(args, "--output") + 1];
+            var resultJsonPath = args[Array.IndexOf(args, "--result-json") + 1];
+            var sceneId = args[Array.IndexOf(args, "--scene-id") + 1];
+            var nodesPath = Path.Combine(outputPath, "nodes");
+            var reportsPath = Path.Combine(outputPath, "reports");
+
+            Directory.CreateDirectory(nodesPath);
+            Directory.CreateDirectory(reportsPath);
+            await File.WriteAllTextAsync(Path.Combine(outputPath, "manifest.json"), "{\"sceneId\":\"test-scene\",\"rootNodeId\":\"r\",\"nodes\":[]}", ct);
+            await File.WriteAllBytesAsync(Path.Combine(nodesPath, "r.bin"), [1, 2, 3], ct);
+            await File.WriteAllTextAsync(Path.Combine(outputPath, "scene.db"), string.Empty, ct);
+            await File.WriteAllTextAsync(Path.Combine(reportsPath, "build-report.json"), "{\"nodeCount\":1}", ct);
+
+            var response = JsonSerializer.Serialize(new
+            {
+                status = "success",
+                exitCode = 0,
+                report = new
+                {
+                    sceneId
+                },
+                artifacts = new
+                {
+                    outputDirectoryPath = outputPath,
+                    nodesDirectoryPath = nodesPath,
+                    manifestPath = Path.Combine(outputPath, "manifest.json"),
+                    sqlitePath = Path.Combine(outputPath, "scene.db"),
+                    buildReportPath = Path.Combine(reportsPath, "build-report.json")
+                }
+            });
+            await File.WriteAllTextAsync(resultJsonPath, response, ct);
+
+            return new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero);
+        }
     }
 }

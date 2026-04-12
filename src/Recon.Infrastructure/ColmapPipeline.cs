@@ -65,7 +65,7 @@ public sealed class ColmapProjectPipelineService(
     {
         var workspace = PrepareWorkspace(context.WorkingDirectory);
         await DownloadProjectImagesAsync(context.Images, workspace.ImagesDirectory, ct);
-        var command = await RunRequiredAsync([ "--help" ], workspace.WorkRoot, ct);
+        var command = await RunColmapRequiredAsync([ "--help" ], workspace.WorkRoot, ct);
         return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Inspect, workspace, [command], new { imageCount = context.Images.Count }), []);
     }
 
@@ -76,7 +76,7 @@ public sealed class ColmapProjectPipelineService(
 
         var commands = new List<ProcessExecutionResult>();
         var databasePath = Path.Combine(workspace.WorkRoot, "database.db");
-        commands.Add(await RunRequiredAsync(
+        commands.Add(await RunColmapRequiredAsync(
         [
             "feature_extractor",
             "--database_path", databasePath,
@@ -85,14 +85,14 @@ public sealed class ColmapProjectPipelineService(
         ], workspace.WorkRoot, ct));
 
         var matcherCommand = ResolveMatcherCommand(context.Project.ConfigJson);
-        commands.Add(await RunRequiredAsync(
+        commands.Add(await RunColmapRequiredAsync(
         [
             matcherCommand,
             "--database_path", databasePath,
             "--FeatureMatching.use_gpu", _options.ColmapUseGpu ? "1" : "0"
         ], workspace.WorkRoot, ct));
 
-        commands.Add(await RunRequiredAsync(
+        commands.Add(await RunColmapRequiredAsync(
         [
             "mapper",
             "--database_path", databasePath,
@@ -111,11 +111,12 @@ public sealed class ColmapProjectPipelineService(
     {
         var workspace = PrepareWorkspace(context.WorkingDirectory);
         await DownloadProjectImagesAsync(context.Images, workspace.ImagesDirectory, ct);
-        var sparseZip = await GetArtifactBytesAsync(context.Run.Id, ArtifactType.SparseModel, ct);
+        var sparseArtifact = await GetArtifactContentAsync(context.Project.Id, context.Run.Id, ArtifactType.SparseModel, ct);
+        var sparseZip = sparseArtifact.Bytes;
         var sparseModelDirectory = ExtractSparseModel(workspace, sparseZip);
 
         var commands = new List<ProcessExecutionResult>();
-        commands.Add(await RunRequiredAsync(
+        commands.Add(await RunColmapRequiredAsync(
         [
             "image_undistorter",
             "--image_path", workspace.ImagesDirectory,
@@ -124,7 +125,7 @@ public sealed class ColmapProjectPipelineService(
             "--output_type", "COLMAP"
         ], workspace.WorkRoot, ct));
 
-        commands.Add(await RunRequiredAsync(
+        commands.Add(await RunColmapRequiredAsync(
         [
             "patch_match_stereo",
             "--workspace_path", workspace.DenseRoot,
@@ -133,7 +134,7 @@ public sealed class ColmapProjectPipelineService(
         ], workspace.WorkRoot, ct));
 
         var fusedPath = Path.Combine(workspace.DenseRoot, "fused.ply");
-        commands.Add(await RunRequiredAsync(
+        commands.Add(await RunColmapRequiredAsync(
         [
             "stereo_fusion",
             "--workspace_path", workspace.DenseRoot,
@@ -144,20 +145,20 @@ public sealed class ColmapProjectPipelineService(
 
         var bytes = await File.ReadAllBytesAsync(fusedPath, ct);
         var artifact = new PipelineArtifact("fused.ply", "application/octet-stream", bytes, ArtifactType.DensePointCloud, JsonSerializer.Serialize(new { format = "ply" }, ReconJson.Defaults));
-        return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Dense, workspace, commands, new { fusedPath }), [artifact]);
+        return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Dense, workspace, commands, new { fusedPath, sparseArtifactRunId = sparseArtifact.Artifact.PipelineRunId }), [artifact]);
     }
 
     public async Task<PipelineExecutionResult> RunExportAsync(ProjectPipelineContext context, CancellationToken ct)
     {
         var workspace = PrepareWorkspace(context.WorkingDirectory);
-        var sparseZip = await GetArtifactBytesAsync(context.Run.Id, ArtifactType.SparseModel, ct);
-        var sparseModelDirectory = ExtractSparseModel(workspace, sparseZip);
         var exportRoot = Path.Combine(workspace.WorkRoot, "export");
         Directory.CreateDirectory(exportRoot);
+        var sparseArtifact = await GetArtifactContentAsync(context.Project.Id, context.Run.Id, ArtifactType.SparseModel, ct);
+        var sparseModelDirectory = ExtractSparseModel(workspace, sparseArtifact.Bytes);
 
         var commands = new List<ProcessExecutionResult>
         {
-            await RunRequiredAsync(
+            await RunColmapRequiredAsync(
             [
                 "model_converter",
                 "--input_path", sparseModelDirectory,
@@ -166,15 +167,77 @@ public sealed class ColmapProjectPipelineService(
             ], workspace.WorkRoot, ct)
         };
 
-        var denseBytes = await TryGetArtifactBytesAsync(context.Run.Id, ArtifactType.DensePointCloud, ct);
-        if (denseBytes is not null)
+        var denseArtifact = await TryGetArtifactContentAsync(context.Project.Id, context.Run.Id, ArtifactType.DensePointCloud, ct);
+        if (denseArtifact is not null)
         {
-            await File.WriteAllBytesAsync(Path.Combine(exportRoot, "fused.ply"), denseBytes, ct);
+            await File.WriteAllBytesAsync(Path.Combine(exportRoot, "fused.ply"), denseArtifact.Bytes, ct);
         }
 
         var bundleBytes = ZipDirectory(exportRoot);
-        var artifact = new PipelineArtifact("export-package.zip", "application/zip", bundleBytes, ArtifactType.OctreePackage, JsonSerializer.Serialize(new { format = "colmap-text-export" }, ReconJson.Defaults));
-        return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Export, workspace, commands, new { exportRoot }), [artifact]);
+        var artifact = new PipelineArtifact(
+            "export-package.zip",
+            "application/zip",
+            bundleBytes,
+            ArtifactType.ExportPackage,
+            JsonSerializer.Serialize(new
+            {
+                format = "colmap-text-export",
+                sparseArtifactRunId = sparseArtifact.Artifact.PipelineRunId,
+                denseArtifactRunId = denseArtifact?.Artifact.PipelineRunId
+            }, ReconJson.Defaults));
+
+        return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Export, workspace, commands, new
+        {
+            exportRoot,
+            sparseArtifactRunId = sparseArtifact.Artifact.PipelineRunId,
+            denseArtifactRunId = denseArtifact?.Artifact.PipelineRunId
+        }), [artifact]);
+    }
+
+    public async Task<PipelineExecutionResult> RunPublishAsync(ProjectPipelineContext context, CancellationToken ct)
+    {
+        var workspace = PrepareWorkspace(context.WorkingDirectory);
+        var publishRoot = Path.Combine(workspace.WorkRoot, "publish");
+        Directory.CreateDirectory(publishRoot);
+        var sceneRoot = Path.Combine(publishRoot, "scene");
+        var fusedPath = Path.Combine(publishRoot, "fused.ply");
+        var automationResponsePath = Path.Combine(publishRoot, "octree-build-response.json");
+        var sceneId = $"run-{context.Run.Id:N}";
+
+        var denseArtifact = await GetArtifactContentAsync(context.Project.Id, context.Run.Id, ArtifactType.DensePointCloud, ct);
+        await File.WriteAllBytesAsync(fusedPath, denseArtifact.Bytes, ct);
+
+        var command = BuildOctreeBuildCommand(fusedPath, sceneRoot, automationResponsePath, sceneId);
+        var processResult = await RunRequiredProcessAsync(command.FileName, command.Arguments, workspace.WorkRoot, "octree-build", ct);
+        var automationResponse = ReadSuccessfulOctreeAutomationResponse(automationResponsePath);
+        var bundleBytes = ZipDirectory(sceneRoot);
+        var artifact = new PipelineArtifact(
+            "octree-scene-package.zip",
+            "application/zip",
+            bundleBytes,
+            ArtifactType.OctreePackage,
+            JsonSerializer.Serialize(new
+            {
+                format = "scannergeo-octree-scene",
+                sceneId,
+                denseArtifactRunId = denseArtifact.Artifact.PipelineRunId,
+                sqliteIncluded = automationResponse.TryGetProperty("artifacts", out var artifacts)
+                    && artifacts.TryGetProperty("sqlitePath", out var sqlitePath)
+                    && sqlitePath.ValueKind == JsonValueKind.String
+                    && !string.IsNullOrWhiteSpace(sqlitePath.GetString())
+            }, ReconJson.Defaults));
+
+        return new PipelineExecutionResult(
+            true,
+            SerializeReport(PipelineStage.Publish, workspace, [processResult], new
+            {
+                fusedPath,
+                publishRoot,
+                sceneRoot,
+                denseArtifactRunId = denseArtifact.Artifact.PipelineRunId,
+                octree = automationResponse
+            }),
+            [artifact]);
     }
 
     private async Task DownloadProjectImagesAsync(IReadOnlyCollection<ProjectImage> images, string imagesDirectory, CancellationToken ct)
@@ -190,16 +253,17 @@ public sealed class ColmapProjectPipelineService(
         }
     }
 
-    private async Task<byte[]> GetArtifactBytesAsync(Guid runId, ArtifactType type, CancellationToken ct)
-        => await TryGetArtifactBytesAsync(runId, type, ct)
-            ?? throw new FileNotFoundException($"Artifact '{type}' for run '{runId}' was not found.");
+    private async Task<ResolvedArtifactContent> GetArtifactContentAsync(Guid projectId, Guid runId, ArtifactType type, CancellationToken ct)
+        => await TryGetArtifactContentAsync(projectId, runId, type, ct)
+            ?? throw new FileNotFoundException($"Artifact '{type}' for run '{runId}' was not found for project '{projectId}'.");
 
-    private async Task<byte[]?> TryGetArtifactBytesAsync(Guid runId, ArtifactType type, CancellationToken ct)
+    private async Task<ResolvedArtifactContent?> TryGetArtifactContentAsync(Guid projectId, Guid runId, ArtifactType type, CancellationToken ct)
     {
         var artifact = (await dbContext.Artifacts.AsNoTracking()
-            .Where(x => x.PipelineRunId == runId && x.Type == type && x.Status == ArtifactStatus.Available)
+            .Where(x => x.ProjectId == projectId && x.Type == type && x.Status == ArtifactStatus.Available)
             .ToListAsync(ct))
-            .OrderByDescending(x => x.CreatedAtUtc)
+            .OrderByDescending(x => x.PipelineRunId == runId)
+            .ThenByDescending(x => x.CreatedAtUtc)
             .FirstOrDefault();
         if (artifact is null)
         {
@@ -215,7 +279,7 @@ public sealed class ColmapProjectPipelineService(
         await using var stream = stored.Stream;
         using var memory = new MemoryStream();
         await stream.CopyToAsync(memory, ct);
-        return memory.ToArray();
+        return new ResolvedArtifactContent(artifact, memory.ToArray());
     }
 
     private string ExtractSparseModel(ColmapWorkspace workspace, byte[] zipBytes)
@@ -232,13 +296,18 @@ public sealed class ColmapProjectPipelineService(
         return Directory.GetDirectories(extractRoot).FirstOrDefault() ?? extractRoot;
     }
 
-    private async Task<ProcessExecutionResult> RunRequiredAsync(IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+    private async Task<ProcessExecutionResult> RunColmapRequiredAsync(IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
     {
-        logger.LogInformation("Running COLMAP command {Command} {Arguments}", _options.ColmapBinaryPath, string.Join(' ', arguments));
-        var result = await processRunner.RunAsync(_options.ColmapBinaryPath, arguments, workingDirectory, ct);
+        return await RunRequiredProcessAsync(_options.ColmapBinaryPath, arguments, workingDirectory, "COLMAP", ct);
+    }
+
+    private async Task<ProcessExecutionResult> RunRequiredProcessAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, string toolName, CancellationToken ct)
+    {
+        logger.LogInformation("Running process {Command} {Arguments}", fileName, string.Join(' ', arguments));
+        var result = await processRunner.RunAsync(fileName, arguments, workingDirectory, ct);
         if (result.ExitCode != 0)
         {
-            throw new InvalidOperationException($"COLMAP command failed with exit code {result.ExitCode}: {result.StandardError}");
+            throw new InvalidOperationException($"{toolName} command failed with exit code {result.ExitCode}: {result.StandardError}");
         }
 
         return result;
@@ -299,6 +368,57 @@ public sealed class ColmapProjectPipelineService(
         }
     }
 
+    private (string FileName, IReadOnlyCollection<string> Arguments) BuildOctreeBuildCommand(string inputPath, string outputPath, string resultJsonPath, string sceneId)
+    {
+        var buildArguments = new List<string>
+        {
+            "build",
+            "--input", inputPath,
+            "--output", outputPath,
+            "--overwrite",
+            "--write-sqlite",
+            "--result-json", resultJsonPath,
+            "--scene-id", sceneId
+        };
+
+        if (!string.IsNullOrWhiteSpace(_options.OctreeCliPath))
+        {
+            var cliPath = Path.GetFullPath(_options.OctreeCliPath);
+            if (cliPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+            {
+                return ("dotnet", [cliPath, .. buildArguments]);
+            }
+
+            return (cliPath, buildArguments);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.OctreeCliProjectPath))
+        {
+            return ("dotnet", ["run", "--project", Path.GetFullPath(_options.OctreeCliProjectPath), "--", .. buildArguments]);
+        }
+
+        throw new InvalidOperationException("Octree export requires either Recon:OctreeCliPath or Recon:OctreeCliProjectPath to be configured.");
+    }
+
+    private static JsonElement ReadSuccessfulOctreeAutomationResponse(string responsePath)
+    {
+        if (!File.Exists(responsePath))
+        {
+            throw new FileNotFoundException($"Octree build did not produce the expected automation response file '{responsePath}'.");
+        }
+
+        using var document = JsonDocument.Parse(File.ReadAllText(responsePath));
+        var root = document.RootElement.Clone();
+        var status = root.TryGetProperty("status", out var statusElement) ? statusElement.GetString() : null;
+        if (!string.Equals(status, "success", StringComparison.OrdinalIgnoreCase))
+        {
+            var message = root.TryGetProperty("message", out var messageElement) ? messageElement.GetString() : null;
+            throw new InvalidOperationException($"Octree build failed: {message ?? "Unknown error."}");
+        }
+
+        return root;
+    }
+
     private static string SerializeReport(PipelineStage stage, ColmapWorkspace workspace, IReadOnlyCollection<ProcessExecutionResult> commands, object extra)
         => JsonSerializer.Serialize(new
         {
@@ -328,4 +448,5 @@ public sealed class ColmapProjectPipelineService(
     }
 
     private sealed record ColmapWorkspace(string WorkRoot, string ImagesDirectory, string SparseRoot, string DenseRoot);
+    private sealed record ResolvedArtifactContent(Artifact Artifact, byte[] Bytes);
 }

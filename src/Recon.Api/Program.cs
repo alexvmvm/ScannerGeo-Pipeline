@@ -3,7 +3,9 @@ using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Options;
 using Recon.Api;
 using Recon.Api.Swagger;
@@ -54,6 +56,7 @@ builder.Services.AddScoped<ImageIntakeService>();
 builder.Services.AddScoped<ImportService>();
 builder.Services.AddScoped<RunService>();
 builder.Services.AddScoped<ArtifactService>();
+builder.Services.AddScoped<ProjectImageService>();
 builder.Services.AddScoped<JobService>();
 builder.Services.AddScoped<JobExecutionCoordinator>();
 
@@ -103,6 +106,15 @@ app.UseExceptionHandler(errorApp =>
 
 app.UseSerilogRequestLogging();
 app.UseStaticFiles();
+var bundledViewerRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot", "octree-viewer");
+if (Directory.Exists(bundledViewerRoot))
+{
+    app.UseStaticFiles(new StaticFileOptions
+    {
+        FileProvider = new PhysicalFileProvider(bundledViewerRoot),
+        RequestPath = "/octree-viewer"
+    });
+}
 
 using (var scope = app.Services.CreateScope())
 {
@@ -117,6 +129,8 @@ if (app.Environment.IsDevelopment() || app.Environment.IsEnvironment("Docker"))
 }
 
 app.MapGet("/ops", () => Results.Redirect("/ops/jobs.html"));
+app.MapGet("/octree-viewer", () => Results.Redirect("/octree-viewer/index.html"));
+app.MapGet("/octree-viewer/", () => Results.Redirect("/octree-viewer/index.html"));
 
 app.MapGet("/health/live", () => Results.Ok(new { status = "live" }))
     .WithTags("Health")
@@ -281,6 +295,19 @@ api.MapGet("/projects/{projectId:guid}/images", async (
   .WithSummary("List project images")
   .WithDescription("Returns images for a project with optional filtering by validation status and source type.");
 
+api.MapGet("/projects/{projectId:guid}/images/{imageId:guid}/content", async (
+    Guid projectId,
+    Guid imageId,
+    string? variant,
+    ProjectImageService projectImageService,
+    CancellationToken ct) =>
+{
+    var (_, content) = await projectImageService.GetImageContentAsync(projectId, imageId, variant, ct);
+    return Results.File(content.Stream, content.ContentType);
+}).WithTags("Images")
+  .WithSummary("Read project image content")
+  .WithDescription("Streams the original project image content or, when requested, a thumbnail preview if one is available.");
+
 api.MapPost("/projects/{projectId:guid}/imports", async (
     Guid projectId,
     CreateImportBatchRequest request,
@@ -359,6 +386,19 @@ api.MapGet("/projects/{projectId:guid}/artifacts", async (
 }).WithTags("Artifacts")
   .WithSummary("List project artifacts")
   .WithDescription("Returns stored artifacts for a project with optional filtering by artifact type, run, and status.");
+
+api.MapGet("/projects/{projectId:guid}/artifacts/{artifactId:guid}/scene/{**entryPath}", async (
+    Guid projectId,
+    Guid artifactId,
+    string entryPath,
+    ArtifactService artifactService,
+    CancellationToken ct) =>
+{
+    var result = await artifactService.GetScenePackageEntryContentAsync(projectId, artifactId, entryPath, ct);
+    return Results.File(result.Content, GuessSceneEntryContentType(result.EntryPath));
+}).WithTags("Artifacts")
+  .WithSummary("Read octree scene package entry")
+  .WithDescription("Returns a file inside a stored octree scene package so the browser viewer can fetch manifest and node payloads directly from the package.");
 
 api.MapGet("/projects/{projectId:guid}/artifacts/{artifactId:guid}", async (
     Guid projectId,
@@ -498,6 +538,14 @@ static PipelineRunResponse ToRunResponse(PipelineRun run)
 static ArtifactResponse ToArtifactResponse(Artifact artifact)
     => new(artifact.Id, artifact.Type, artifact.Status, artifact.FileName, artifact.MimeType, artifact.FileSizeBytes, artifact.PipelineRunId, artifact.CreatedAtUtc);
 
+static string GuessSceneEntryContentType(string entryPath)
+{
+    var provider = new FileExtensionContentTypeProvider();
+    return provider.TryGetContentType(entryPath, out var contentType)
+        ? contentType
+        : "application/octet-stream";
+}
+
 static JobResponse ToJobResponse(Job job)
     => new(job.Id, job.Type, job.Status, job.ProjectId, job.PipelineRunId, job.ProgressPercent, job.ProgressMessage, job.CreatedAtUtc, job.StartedAtUtc, job.FinishedAtUtc);
 
@@ -532,10 +580,19 @@ static bool IsPayloadTooLarge(Exception exception)
 static void AddSharedReconConfig(ConfigurationManager configuration, string contentRootPath, string environmentName)
 {
     var solutionRoot = Path.GetFullPath(Path.Combine(contentRootPath, "..", ".."));
+    var defaultOctreeProjectPath = Path.Combine(solutionRoot, "external", "ScannerGeo-Octree", "src", "OctreeBuild.Cli", "OctreeBuild.Cli.csproj");
     configuration.AddJsonFile("reconsettings.json", optional: true, reloadOnChange: true);
     configuration.AddJsonFile($"reconsettings.{environmentName}.json", optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, "reconsettings.json"), optional: true, reloadOnChange: true);
     configuration.AddJsonFile(Path.Combine(solutionRoot, $"reconsettings.{environmentName}.json"), optional: true, reloadOnChange: true);
+    if (File.Exists(defaultOctreeProjectPath))
+    {
+        configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Recon:OctreeCliProjectPath"] = defaultOctreeProjectPath
+        });
+    }
+
     configuration.AddEnvironmentVariables();
 }
 

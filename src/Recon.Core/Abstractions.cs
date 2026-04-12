@@ -41,6 +41,7 @@ public interface IStorageKeyFactory
     string GetReportKey(Guid projectId, Guid runId, PipelineStage stage);
     string GetDenseOutputKey(Guid projectId, Guid runId, string fileName);
     string GetSparseOutputKey(Guid projectId, Guid runId, string fileName);
+    string GetExportOutputKey(Guid projectId, Guid runId, string fileName);
     string GetLogKey(Guid projectId, Guid runId, Guid jobId);
     string GetSummaryKey(Guid projectId);
 }
@@ -99,6 +100,7 @@ public interface IProjectPipelineService
     Task<PipelineExecutionResult> RunSparseAsync(ProjectPipelineContext context, CancellationToken ct);
     Task<PipelineExecutionResult> RunDenseAsync(ProjectPipelineContext context, CancellationToken ct);
     Task<PipelineExecutionResult> RunExportAsync(ProjectPipelineContext context, CancellationToken ct);
+    Task<PipelineExecutionResult> RunPublishAsync(ProjectPipelineContext context, CancellationToken ct);
 }
 
 public interface IJobQueue
@@ -137,6 +139,8 @@ public sealed class ReconOptions
     public string PipelineProvider { get; set; } = "Simulated";
     public string ColmapBinaryPath { get; set; } = "colmap";
     public bool ColmapUseGpu { get; set; }
+    public string? OctreeCliPath { get; set; }
+    public string? OctreeCliProjectPath { get; set; }
     public int WorkerIdlePollSeconds { get; set; } = 5;
     public string ScratchRootPath { get; set; } = Path.Combine(Path.GetTempPath(), "recon");
     public string PipelineVersion { get; set; } = "mvp-simulated";

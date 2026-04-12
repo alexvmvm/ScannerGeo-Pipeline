@@ -1,10 +1,12 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.IO.Compression;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Recon.Domain;
+using Recon.Core;
 using Recon.Infrastructure;
 
 namespace Recon.Api.Tests;
@@ -63,6 +65,29 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         var payload = await response.Content.ReadFromJsonAsync<UploadPayload>(_jsonOptions);
         Assert.Single(payload!.Images);
         Assert.Equal("tiny.png", payload.Images.First().OriginalFileName);
+    }
+
+    [Fact]
+    public async Task ProjectImageContent_ReturnsStoredImageBytes()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Image Content Project");
+
+        using var multipart = new MultipartFormDataContent();
+        var content = new ByteArrayContent(TinyPngBytes());
+        content.Headers.ContentType = MediaTypeHeaderValue.Parse("image/png");
+        multipart.Add(content, "files", "tiny.png");
+
+        var uploadResponse = await client.PostAsync($"/api/v1/projects/{project.Id}/images", multipart);
+        uploadResponse.StatusCode.ShouldBe(HttpStatusCode.Accepted);
+        var payload = await uploadResponse.Content.ReadFromJsonAsync<UploadPayload>(_jsonOptions);
+
+        var response = await client.GetAsync($"/api/v1/projects/{project.Id}/images/{payload!.Images.First().Id}/content");
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        response.Content.Headers.ContentType?.MediaType.ShouldBe("image/png");
+        var bytes = await response.Content.ReadAsByteArrayAsync();
+        Assert.Equal(TinyPngBytes(), bytes);
     }
 
     [Fact]
@@ -178,6 +203,49 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         var html = await response.Content.ReadAsStringAsync();
         Assert.Contains("Operations", html);
         Assert.Contains("Projects", html);
+        Assert.Contains("Photos", html);
+    }
+
+    [Fact]
+    public async Task ProjectPhotosPage_IsServed()
+    {
+        var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/ops/project-photos.html");
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        response.Content.Headers.ContentType?.MediaType.ShouldBe("text/html");
+        var html = await response.Content.ReadAsStringAsync();
+        Assert.Contains("Project Photos", html);
+    }
+
+    [Fact]
+    public async Task OctreeViewerPage_IsServed()
+    {
+        var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/octree-viewer/index.html");
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        response.Content.Headers.ContentType?.MediaType.ShouldBe("text/html");
+        var html = await response.Content.ReadAsStringAsync();
+        Assert.Contains("Octree Viewer", html);
+    }
+
+    [Fact]
+    public async Task OctreeSceneEntryEndpoint_ReturnsManifestFromStoredPackage()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Octree Viewer Project");
+        var artifactId = await SeedOctreeArtifactAsync(project.Id);
+
+        var response = await client.GetAsync($"/api/v1/projects/{project.Id}/artifacts/{artifactId}/scene/manifest.json");
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        response.Content.Headers.ContentType?.MediaType.ShouldBe("application/json");
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("\"sceneId\":\"test-scene\"", body);
+        Assert.Contains("\"rootNodeId\":\"r\"", body);
     }
 
     [Fact]
@@ -290,8 +358,86 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         await db.SaveChangesAsync();
     }
 
+    private async Task<Guid> SeedOctreeArtifactAsync(Guid projectId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ReconDbContext>();
+        var objectStorage = scope.ServiceProvider.GetRequiredService<IObjectStorage>();
+        var artifactId = Guid.NewGuid();
+        var storageKey = $"projects/{projectId}/runs/test/export/octree-scene-package.zip";
+        var now = DateTimeOffset.UtcNow;
+
+        await using (var zipStream = new MemoryStream(CreateOctreeScenePackageBytes()))
+        {
+            await objectStorage.SaveAsync(storageKey, zipStream, "application/zip", CancellationToken.None);
+        }
+
+        db.Artifacts.Add(new Artifact
+        {
+            Id = artifactId,
+            ProjectId = projectId,
+            Type = ArtifactType.OctreePackage,
+            Status = ArtifactStatus.Available,
+            StorageKey = storageKey,
+            FileName = "octree-scene-package.zip",
+            MimeType = "application/zip",
+            FileSizeBytes = 0,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now
+        });
+
+        await db.SaveChangesAsync();
+        return artifactId;
+    }
+
     private static byte[] TinyPngBytes()
         => Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==");
+
+    private static byte[] CreateOctreeScenePackageBytes()
+    {
+        using var memory = new MemoryStream();
+        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var manifestEntry = archive.CreateEntry("scene/manifest.json");
+            using (var writer = new StreamWriter(manifestEntry.Open()))
+            {
+                writer.Write("""
+{"version":1,"sceneId":"test-scene","rootNodeId":"r","bounds":{"min":[0,0,0],"max":[1,1,1]},"nodes":[{"nodeId":"r","parentNodeId":null,"depth":0,"file":"nodes/r.bin","pointCount":1,"childMask":0,"isLeaf":true,"version":1,"geometricError":1,"bounds":{"min":[0,0,0],"max":[1,1,1]}}]}
+""");
+            }
+
+            var nodeEntry = archive.CreateEntry("scene/nodes/r.bin");
+            using var nodeStream = nodeEntry.Open();
+            nodeStream.Write(CreateOctreeNodeBytes());
+        }
+
+        return memory.ToArray();
+    }
+
+    private static byte[] CreateOctreeNodeBytes()
+    {
+        using var memory = new MemoryStream();
+        using var writer = new BinaryWriter(memory);
+        writer.Write(new[] { (byte)'O', (byte)'C', (byte)'T', (byte)'N' });
+        writer.Write((ushort)1);
+        writer.Write((ushort)0);
+        writer.Write((uint)1);
+        writer.Write(0f);
+        writer.Write(0f);
+        writer.Write(0f);
+        writer.Write(1f);
+        writer.Write(1f);
+        writer.Write(1f);
+        writer.Write(new byte[12]);
+        writer.Write((ushort)32768);
+        writer.Write((ushort)32768);
+        writer.Write((ushort)32768);
+        writer.Write((byte)255);
+        writer.Write((byte)255);
+        writer.Write((byte)255);
+        writer.Flush();
+        return memory.ToArray();
+    }
 
     private sealed record ProjectPayload(Guid Id, string Name, string Status);
     private sealed record ProjectListItemPayload(Guid Id, string Name);

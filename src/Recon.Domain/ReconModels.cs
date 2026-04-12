@@ -75,7 +75,9 @@ public enum ArtifactType
     OctreePackage,
     PotreePackage,
     LogFile,
-    SummaryJson
+    SummaryJson,
+    ExportPackage,
+    PublishReport
 }
 
 public enum ArtifactStatus

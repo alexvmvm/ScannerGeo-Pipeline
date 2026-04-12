@@ -154,7 +154,13 @@ public sealed class SimulatedProjectPipelineService : IProjectPipelineService
     public Task<PipelineExecutionResult> RunExportAsync(ProjectPipelineContext context, CancellationToken ct)
         => Task.FromResult(CreateResult(context, PipelineStage.Export,
         [
-            new PipelineArtifact("viewer.zip", "application/zip", CreateSimulatedExportPlaceholderBytes(), ArtifactType.PotreePackage, "{\"simulated\":true}")
+            new PipelineArtifact("export-package.zip", "application/zip", CreateSimulatedExportPlaceholderBytes(), ArtifactType.ExportPackage, "{\"simulated\":true,\"format\":\"colmap-text-export\"}")
+        ]));
+
+    public Task<PipelineExecutionResult> RunPublishAsync(ProjectPipelineContext context, CancellationToken ct)
+        => Task.FromResult(CreateResult(context, PipelineStage.Publish,
+        [
+            new PipelineArtifact("octree-scene-package.zip", "application/zip", CreateSimulatedExportPlaceholderBytes(), ArtifactType.OctreePackage, "{\"simulated\":true,\"format\":\"scannergeo-octree-scene\"}")
         ]));
 
     private static PipelineExecutionResult CreateResult(ProjectPipelineContext context, PipelineStage stage, IReadOnlyCollection<PipelineArtifact> artifacts)

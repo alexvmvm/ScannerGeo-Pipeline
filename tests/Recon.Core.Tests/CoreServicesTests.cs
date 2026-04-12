@@ -333,7 +333,7 @@ public sealed class CoreServicesTests
                 new StubUrlImporter(),
                 new UrlImportSecurityValidator(),
                 new ImportService(DbContext, Queue, Clock),
-                new ProjectService(DbContext, Clock, new ProjectStatusService(), Options.Create(new ReconOptions())),
+                new ProjectService(DbContext, Clock, new ProjectStatusService(), Options.Create(new ReconOptions()), Storage),
                 Options.Create(new ReconOptions { ScratchRootPath = StorageRoot }),
                 NullLogger<JobExecutionCoordinator>.Instance);
 

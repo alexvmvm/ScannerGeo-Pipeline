@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Security;
 using System.Security.Cryptography;
 using System.Text;
@@ -400,7 +401,7 @@ public sealed class RunService(
 
         var now = clock.UtcNow;
         var stages = model.Stages.Count == 0
-            ? [PipelineStage.Inspect, PipelineStage.Sparse, PipelineStage.Dense, PipelineStage.Export]
+            ? [PipelineStage.Inspect, PipelineStage.Sparse, PipelineStage.Dense, PipelineStage.Export, PipelineStage.Publish]
             : model.Stages.Distinct().ToArray();
 
         var run = new PipelineRun
@@ -482,6 +483,109 @@ public sealed class ArtifactService(IReconDbContext dbContext, IObjectStorage ob
             ?? throw new NotFoundException($"Artifact '{artifactId}' content is unavailable.");
         return (artifact, content);
     }
+
+    public async Task<(Artifact Artifact, string EntryPath, byte[] Content)> GetScenePackageEntryContentAsync(
+        Guid projectId,
+        Guid artifactId,
+        string entryPath,
+        CancellationToken ct)
+    {
+        var normalizedEntryPath = NormalizeSceneEntryPath(entryPath);
+        var (artifact, storedObject) = await GetArtifactContentAsync(projectId, artifactId, ct);
+        if (artifact.Type != ArtifactType.OctreePackage)
+        {
+            throw new NotFoundException($"Artifact '{artifactId}' is not an octree scene package.");
+        }
+
+        await using var storedStream = storedObject.Stream;
+        Stream archiveStream;
+        if (storedStream.CanSeek)
+        {
+            storedStream.Position = 0;
+            archiveStream = storedStream;
+        }
+        else
+        {
+            var buffered = new MemoryStream();
+            await storedStream.CopyToAsync(buffered, ct);
+            buffered.Position = 0;
+            archiveStream = buffered;
+        }
+
+        using var archive = new ZipArchive(archiveStream, ZipArchiveMode.Read, leaveOpen: false);
+        var zipEntryPath = $"scene/{normalizedEntryPath}";
+        var entry = archive.Entries.FirstOrDefault(x => string.Equals(
+            x.FullName.Replace('\\', '/'),
+            zipEntryPath,
+            StringComparison.OrdinalIgnoreCase));
+        if (entry is null)
+        {
+            throw new NotFoundException($"Scene entry '{normalizedEntryPath}' was not found in artifact '{artifactId}'.");
+        }
+
+        await using var entryStream = entry.Open();
+        using var memory = new MemoryStream();
+        await entryStream.CopyToAsync(memory, ct);
+        return (artifact, entry.FullName, memory.ToArray());
+    }
+
+    private static string NormalizeSceneEntryPath(string entryPath)
+    {
+        if (string.IsNullOrWhiteSpace(entryPath))
+        {
+            throw new NotFoundException("A scene entry path is required.");
+        }
+
+        var segments = entryPath.Replace('\\', '/')
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length == 0 || segments.Any(segment => segment is "." or ".."))
+        {
+            throw new NotFoundException("The requested scene entry path is invalid.");
+        }
+
+        return string.Join('/', segments);
+    }
+}
+
+public sealed class ProjectImageService(
+    IReconDbContext dbContext,
+    IObjectStorage objectStorage,
+    IStorageKeyFactory storageKeyFactory)
+{
+    public async Task<(ProjectImage Image, StoredObject Content)> GetImageContentAsync(
+        Guid projectId,
+        Guid imageId,
+        string? variant,
+        CancellationToken ct)
+    {
+        var image = await dbContext.ProjectImages.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.ProjectId == projectId && x.Id == imageId, ct)
+            ?? throw new NotFoundException($"Project image '{imageId}' was not found.");
+
+        var normalizedVariant = string.IsNullOrWhiteSpace(variant) ? "original" : variant.Trim().ToLowerInvariant();
+        return normalizedVariant switch
+        {
+            "original" => (image, await OpenRequiredAsync(image.StorageKey, $"Project image '{imageId}' content is unavailable.", ct)),
+            "thumbnail" => await GetThumbnailOrOriginalAsync(image, ct),
+            _ => throw new NotFoundException($"Image variant '{variant}' is not supported.")
+        };
+    }
+
+    private async Task<(ProjectImage Image, StoredObject Content)> GetThumbnailOrOriginalAsync(ProjectImage image, CancellationToken ct)
+    {
+        var thumbnailKey = storageKeyFactory.GetThumbnailKey(image.ProjectId, image.Id);
+        var thumbnail = await objectStorage.OpenReadAsync(thumbnailKey, ct);
+        if (thumbnail is not null)
+        {
+            return (image, thumbnail);
+        }
+
+        return (image, await OpenRequiredAsync(image.StorageKey, $"Project image '{image.Id}' content is unavailable.", ct));
+    }
+
+    private async Task<StoredObject> OpenRequiredAsync(string storageKey, string message, CancellationToken ct)
+        => await objectStorage.OpenReadAsync(storageKey, ct)
+            ?? throw new NotFoundException(message);
 }
 
 public sealed class JobService(IReconDbContext dbContext)
@@ -607,6 +711,9 @@ public sealed class JobExecutionCoordinator(
                 break;
             case JobType.ExportArtifacts:
                 await HandlePipelineStageAsync(job, PipelineStage.Export, ct);
+                break;
+            case JobType.PublishArtifacts:
+                await HandlePipelineStageAsync(job, PipelineStage.Publish, ct);
                 break;
             case JobType.GenerateProjectSummary:
                 await HandleGenerateSummaryAsync(job, ct);
@@ -787,6 +894,7 @@ public sealed class JobExecutionCoordinator(
             PipelineStage.Sparse => await pipelineService.RunSparseAsync(context, ct),
             PipelineStage.Dense => await pipelineService.RunDenseAsync(context, ct),
             PipelineStage.Export => await pipelineService.RunExportAsync(context, ct),
+            PipelineStage.Publish => await pipelineService.RunPublishAsync(context, ct),
             _ => throw new NotSupportedException($"Stage '{stage}' is not supported.")
         };
 
@@ -808,6 +916,7 @@ public sealed class JobExecutionCoordinator(
                 PipelineStage.Sparse => ArtifactType.SparseReport,
                 PipelineStage.Dense => ArtifactType.DenseReport,
                 PipelineStage.Export => ArtifactType.ExportReport,
+                PipelineStage.Publish => ArtifactType.PublishReport,
                 _ => ArtifactType.LogFile
             },
             Status = ArtifactStatus.Available,
@@ -824,6 +933,7 @@ public sealed class JobExecutionCoordinator(
             var key = generatedArtifact.ArtifactType switch
             {
                 ArtifactType.SparseModel => storageKeyFactory.GetSparseOutputKey(project.Id, run.Id, generatedArtifact.FileName),
+                ArtifactType.OctreePackage or ArtifactType.PotreePackage or ArtifactType.ExportPackage => storageKeyFactory.GetExportOutputKey(project.Id, run.Id, generatedArtifact.FileName),
                 _ => storageKeyFactory.GetDenseOutputKey(project.Id, run.Id, generatedArtifact.FileName)
             };
 
@@ -973,6 +1083,7 @@ public sealed class JobExecutionCoordinator(
         PipelineStage.Sparse => JobType.RunSparseReconstruction,
         PipelineStage.Dense => JobType.RunDenseReconstruction,
         PipelineStage.Export => JobType.ExportArtifacts,
+        PipelineStage.Publish => JobType.PublishArtifacts,
         _ => throw new NotSupportedException($"Stage '{stage}' is not supported.")
     };
 
@@ -994,6 +1105,7 @@ public sealed class JobExecutionCoordinator(
         PipelineStage.Sparse => 1,
         PipelineStage.Dense => 2,
         PipelineStage.Export => 3,
+        PipelineStage.Publish => 4,
         _ => 99
     };
 }

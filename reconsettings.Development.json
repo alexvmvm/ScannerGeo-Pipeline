@@ -8,6 +8,6 @@
     "ColmapUseGpu": true,
     "StorageRootPath": "../../.data/storage",
     "ScratchRootPath": "../../.data/scratch",
-    "PipelineVersion": "colmap"
+    "PipelineVersion": "colmap-octree"
   }
 }

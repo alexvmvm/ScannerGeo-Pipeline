@@ -66,6 +66,7 @@ FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
 COPY . .
+RUN dotnet publish external/ScannerGeo-Octree/src/OctreeBuild.Cli/OctreeBuild.Cli.csproj -c Release -o /app/octree-build
 RUN dotnet publish src/Recon.Worker/Recon.Worker.csproj -c Release -o /app/publish
 
 FROM colmap-base AS final
@@ -76,6 +77,7 @@ RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
 
 WORKDIR /app
 COPY --from=build /app/publish .
+COPY --from=build /app/octree-build ./tools/octree-build
 
 ENV DOTNET_ROOT=/usr/share/dotnet
 ENV XDG_RUNTIME_DIR=/tmp/runtime-root

@@ -20,6 +20,8 @@ src/
   Recon.Core/           Application services and abstractions
   Recon.Domain/         Domain models and enums
   Recon.Infrastructure/ EF Core, storage, pipeline adapters
+external/
+  ScannerGeo-Octree/    Pinned octree scene builder submodule
 tests/
   Recon.Api.Tests/
   Recon.Core.Tests/
@@ -32,7 +34,7 @@ tests/
 - Upload image files with size, count, and extension validation
 - Import images from remote HTTP/HTTPS URLs with SSRF-style network checks
 - Queue and process background jobs in Postgres
-- Run a staged reconstruction pipeline: `Inspect`, `Sparse`, `Dense`, `Export`
+- Run a staged reconstruction pipeline: `Inspect`, `Sparse`, `Dense`, `Export`, `Publish`
 - Store generated reports and artifacts
 - Expose health endpoints, Swagger, and a simple ops page for job inspection
 
@@ -43,7 +45,7 @@ The service supports two pipeline providers:
 - `Simulated`
   Good default for local development and CI. Produces synthetic artifacts without requiring COLMAP.
 - `Colmap`
-  Uses the configured `colmap` binary for sparse, dense, and export stages. The worker validates the COLMAP runtime on startup when this mode is enabled.
+  Uses the configured `colmap` binary for sparse and dense reconstruction, writes a COLMAP text export during `Export`, and invokes the octree builder during `Publish` to produce a scene package artifact. The worker validates the COLMAP runtime on startup when this mode is enabled.
 
 ## Default local endpoints
 
@@ -75,6 +77,8 @@ Important `Recon` settings:
 - `PipelineProvider`: `Simulated` or `Colmap`
 - `ColmapBinaryPath`: path to the `colmap` executable
 - `ColmapUseGpu`: enables COLMAP GPU flags when `true`
+- `OctreeCliPath`: path to a published `OctreeBuild.Cli.dll` or native `octree-build` executable
+- `OctreeCliProjectPath`: optional source-project fallback for local development when invoking the octree CLI via `dotnet run`
 - `ObjectStorageProvider`: `Minio` or `FileSystem`
 - `ObjectStorageEndpoint`, `ObjectStorageBucket`, `ObjectStorageAccessKey`, `ObjectStorageSecretKey`
 - `StorageRootPath`: filesystem storage root when using `FileSystem`
@@ -84,6 +88,7 @@ Important `Recon` settings:
 Notes:
 
 - The API and worker both load `reconsettings*.json` from the project and solution root.
+- Local repo checkouts auto-detect the bundled `external/ScannerGeo-Octree` submodule and use its CLI project as the default octree export target.
 - Database initialization is automatic on startup. Postgres uses EF Core migrations guarded by an advisory lock.
 - `.env.example` is geared toward COLMAP-based Docker runs. If you do not have COLMAP available, use `Simulated`.
 
@@ -92,6 +97,7 @@ Notes:
 For the fastest local bring-up, use Compose:
 
 ```powershell
+git submodule update --init --recursive
 docker compose up --build
 ```
 
@@ -118,6 +124,7 @@ Prerequisites:
 Start infrastructure, then run:
 
 ```powershell
+git submodule update --init --recursive
 dotnet restore
 dotnet run --project src/Recon.Api
 dotnet run --project src/Recon.Worker
@@ -175,7 +182,7 @@ POST /api/v1/projects/{projectId}/runs
 Content-Type: application/json
 
 {
-  "stages": ["Inspect", "Sparse", "Dense", "Export"],
+  "stages": ["Inspect", "Sparse", "Dense", "Export", "Publish"],
   "forceRebuild": false
 }
 ```
@@ -189,7 +196,8 @@ The system records both source assets and generated outputs. Depending on the pi
 - per-stage JSON reports
 - sparse model outputs
 - dense point cloud outputs
-- export bundles
+- COLMAP text export bundles
+- octree scene packages
 - summary JSON
 - failure log files
 

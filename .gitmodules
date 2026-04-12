@@ -1,0 +1,3 @@
+[submodule "external/ScannerGeo-Octree"]
+	path = external/ScannerGeo-Octree
+	url = https://github.com/alexvmvm/ScannerGeo-Octree.git

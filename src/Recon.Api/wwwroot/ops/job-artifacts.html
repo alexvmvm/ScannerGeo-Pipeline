@@ -91,6 +91,8 @@ function esc(v){return String(v).replaceAll("&","&amp;").replaceAll("<","&lt;").
 function fmtDate(v){if(!v)return"None";const d=new Date(v);return Number.isNaN(d.getTime())?v:d.toLocaleString()}
 function fmtSize(v){if(v==null)return"Unknown";const units=["B","KB","MB","GB"];let size=v,unit=0;while(size>=1024&&unit<units.length-1){size/=1024;unit++}return `${size.toFixed(size>=10||unit===0?0:1)} ${units[unit]}`}
 function isSimulatedPipelineVersion(v){return !!v&&String(v).toLowerCase().includes("simulated")}
+function octreeViewerHref(projectId,artifactId){const sceneBase=`/api/v1/projects/${encodeURIComponent(projectId)}/artifacts/${encodeURIComponent(artifactId)}/scene/`;return `/octree-viewer/index.html?scene=${encodeURIComponent(sceneBase)}`}
+function inspectLink(artifact){return artifact.type==="OctreePackage"&&artifact.status==="Available"&&!isSimulatedPipelineVersion(currentRun&&currentRun.pipelineVersion)?`<br><a href="${octreeViewerHref(currentJob.projectId,artifact.id)}" target="_blank" rel="noopener">Inspect In Viewer</a>`:""}
 function setStatus(message,state){statusLine.textContent=message;statusLine.className=state?`status ${state}`:"status"}
 async function readErr(r){try{const b=await r.json();return b.detail||b.title||`HTTP ${r.status}`}catch{return`HTTP ${r.status}`}}
 async function fetchJson(url){const r=await fetch(url,{headers:{Accept:"application/json"}});if(!r.ok)throw new Error(await readErr(r));return r.status===204?null:await r.json()}
@@ -139,7 +141,7 @@ function renderArtifactTable(){
     return;
   }
   artifactTableHost.className="";
-  artifactTableHost.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Type</th><th>File</th><th>Status</th><th>Size</th><th>Created</th><th>Access</th></tr></thead><tbody>${artifacts.map(artifact=>`<tr><td><span class="badge">${esc(artifact.type)}</span></td><td><strong>${esc(artifact.fileName)}</strong><br><span class="subtle">${esc(artifact.mimeType)}</span></td><td><span class="state ${String(artifact.status).toLowerCase()}">${esc(artifact.status)}</span></td><td>${esc(fmtSize(artifact.fileSizeBytes))}</td><td>${esc(fmtDate(artifact.createdAtUtc))}</td><td><a href="/api/v1/projects/${encodeURIComponent(currentJob.projectId)}/artifacts/${encodeURIComponent(artifact.id)}" target="_blank" rel="noopener">Open / Download</a></td></tr>`).join("")}</tbody></table></div>`;
+  artifactTableHost.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Type</th><th>File</th><th>Status</th><th>Size</th><th>Created</th><th>Access</th></tr></thead><tbody>${artifacts.map(artifact=>`<tr><td><span class="badge">${esc(artifact.type)}</span></td><td><strong>${esc(artifact.fileName)}</strong><br><span class="subtle">${esc(artifact.mimeType)}</span></td><td><span class="state ${String(artifact.status).toLowerCase()}">${esc(artifact.status)}</span></td><td>${esc(fmtSize(artifact.fileSizeBytes))}</td><td>${esc(fmtDate(artifact.createdAtUtc))}</td><td><a href="/api/v1/projects/${encodeURIComponent(currentJob.projectId)}/artifacts/${encodeURIComponent(artifact.id)}" target="_blank" rel="noopener">Open / Download</a>${inspectLink(artifact)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
 async function loadPage(){

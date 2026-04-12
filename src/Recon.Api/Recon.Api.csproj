@@ -10,6 +10,10 @@
     <Content Include="..\..\reconsettings.json" Link="reconsettings.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\reconsettings.Development.json" Link="reconsettings.Development.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\reconsettings.Docker.json" Link="reconsettings.Docker.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\external\ScannerGeo-Octree\octree-viewer\**\*"
+             Link="wwwroot\octree-viewer\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

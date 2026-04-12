@@ -39,6 +39,9 @@ public sealed class StorageKeyFactory : IStorageKeyFactory
     public string GetSparseOutputKey(Guid projectId, Guid runId, string fileName)
         => $"projects/{projectId}/runs/{runId}/sparse/{Sanitize(fileName)}";
 
+    public string GetExportOutputKey(Guid projectId, Guid runId, string fileName)
+        => $"projects/{projectId}/runs/{runId}/export/{Sanitize(fileName)}";
+
     public string GetLogKey(Guid projectId, Guid runId, Guid jobId)
         => $"projects/{projectId}/runs/{runId}/logs/{jobId}.log";
 

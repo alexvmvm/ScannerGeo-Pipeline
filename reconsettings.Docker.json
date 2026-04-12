@@ -4,6 +4,7 @@
     "ObjectStorageAccessKey": "minioadmin",
     "ObjectStorageSecretKey": "minioadmin",
     "StorageRootPath": "/var/recon/storage",
-    "ScratchRootPath": "/tmp/recon"
+    "ScratchRootPath": "/tmp/recon",
+    "PipelineVersion": "colmap-octree"
   }
 }
