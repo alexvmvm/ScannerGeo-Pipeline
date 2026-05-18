@@ -139,6 +139,9 @@ public sealed class ReconOptions
     public string PipelineProvider { get; set; } = "Simulated";
     public string ColmapBinaryPath { get; set; } = "colmap";
     public bool ColmapUseGpu { get; set; }
+    public int ColmapDenseMaxImageSize { get; set; }
+    public bool ColmapDenseRetryOnCudaFailure { get; set; } = true;
+    public int ColmapDenseRetryMaxImageSize { get; set; } = 4096;
     public string? OctreeCliPath { get; set; }
     public string? OctreeCliProjectPath { get; set; }
     public int WorkerIdlePollSeconds { get; set; } = 5;

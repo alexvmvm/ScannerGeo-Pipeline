@@ -57,6 +57,8 @@ builder.Services.AddScoped<ImportService>();
 builder.Services.AddScoped<RunService>();
 builder.Services.AddScoped<ArtifactService>();
 builder.Services.AddScoped<ProjectImageService>();
+builder.Services.AddScoped<PointProjectionService>();
+builder.Services.AddScoped<ImagesForPointQueryService>();
 builder.Services.AddScoped<JobService>();
 builder.Services.AddScoped<JobExecutionCoordinator>();
 
@@ -308,6 +310,43 @@ api.MapGet("/projects/{projectId:guid}/images/{imageId:guid}/content", async (
   .WithSummary("Read project image content")
   .WithDescription("Streams the original project image content or, when requested, a thumbnail preview if one is available.");
 
+api.MapPost("/projects/{projectId:guid}/query/images-for-point", async (
+    Guid projectId,
+    ImagesForPointRequest request,
+    IValidator<ImagesForPointRequest> validator,
+    ImagesForPointQueryService queryService,
+    CancellationToken ct) =>
+{
+    await validator.ValidateAndThrowRequestAsync(request, ct);
+    var query = new ImagesForPointQuery(
+        request.Point!.X,
+        request.Point.Y,
+        request.Point.Z,
+        request.MaxResults ?? 20,
+        request.RunId,
+        request.IncludeImageUrls ?? true);
+    var result = await queryService.QueryAsync(projectId, query, ct);
+    return Results.Ok(new ImagesForPointResponse(
+        result.ProjectId,
+        result.RunId,
+        new Point3Response(result.X, result.Y, result.Z),
+        result.MatchCount,
+        result.Matches.Select(x => new ImagePointMatchResponse(
+            x.ImageId,
+            x.FileName,
+            x.Width,
+            x.Height,
+            x.U,
+            x.V,
+            x.Score,
+            x.CameraDistance,
+            x.DistanceToImageCenterPixels,
+            x.ImageUrl,
+            x.ThumbnailUrl)).ToArray()));
+}).WithTags("Queries")
+  .WithSummary("Find source images for a 3D point")
+  .WithDescription("Returns the source images that likely show a given 3D point, along with projected pixel coordinates. This MVP is geometric only and does not perform occlusion testing.");
+
 api.MapPost("/projects/{projectId:guid}/imports", async (
     Guid projectId,
     CreateImportBatchRequest request,
@@ -536,7 +575,15 @@ static PipelineRunResponse ToRunResponse(PipelineRun run)
     => new(run.Id, run.Status, run.PipelineVersion, run.CreatedAtUtc, run.StartedAtUtc, run.FinishedAtUtc);
 
 static ArtifactResponse ToArtifactResponse(Artifact artifact)
-    => new(artifact.Id, artifact.Type, artifact.Status, artifact.FileName, artifact.MimeType, artifact.FileSizeBytes, artifact.PipelineRunId, artifact.CreatedAtUtc);
+    => new(
+        artifact.Id,
+        ArtifactTypeCompatibility.GetEffectiveType(artifact),
+        artifact.Status,
+        artifact.FileName,
+        artifact.MimeType,
+        artifact.FileSizeBytes,
+        artifact.PipelineRunId,
+        artifact.CreatedAtUtc);
 
 static string GuessSceneEntryContentType(string entryPath)
 {

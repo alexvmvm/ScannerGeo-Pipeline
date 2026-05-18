@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Compression;
+using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -125,12 +127,17 @@ public sealed class ColmapProjectPipelineService(
             "--output_type", "COLMAP"
         ], workspace.WorkRoot, ct));
 
+        var patchMatchResult = await RunDensePatchMatchStereoAsync(workspace, ct);
+        commands.AddRange(patchMatchResult.Commands);
+
+        var denseSparseTextRoot = Path.Combine(workspace.WorkRoot, "dense_sparse_txt");
+        Directory.CreateDirectory(denseSparseTextRoot);
         commands.Add(await RunColmapRequiredAsync(
         [
-            "patch_match_stereo",
-            "--workspace_path", workspace.DenseRoot,
-            "--workspace_format", "COLMAP",
-            "--PatchMatchStereo.geom_consistency", "true"
+            "model_converter",
+            "--input_path", Path.Combine(workspace.DenseRoot, "sparse"),
+            "--output_path", denseSparseTextRoot,
+            "--output_type", "TXT"
         ], workspace.WorkRoot, ct));
 
         var fusedPath = Path.Combine(workspace.DenseRoot, "fused.ply");
@@ -140,12 +147,39 @@ public sealed class ColmapProjectPipelineService(
             "--workspace_path", workspace.DenseRoot,
             "--workspace_format", "COLMAP",
             "--input_type", "geometric",
+            .. BuildStereoFusionOptions(patchMatchResult.MaxImageSize),
             "--output_path", fusedPath
         ], workspace.WorkRoot, ct));
 
         var bytes = await File.ReadAllBytesAsync(fusedPath, ct);
-        var artifact = new PipelineArtifact("fused.ply", "application/octet-stream", bytes, ArtifactType.DensePointCloud, JsonSerializer.Serialize(new { format = "ply" }, ReconJson.Defaults));
-        return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Dense, workspace, commands, new { fusedPath, sparseArtifactRunId = sparseArtifact.Artifact.PipelineRunId }), [artifact]);
+        EnsurePlyContainsFiniteVertexPositions(bytes, "Dense reconstruction produced an unusable fused point cloud.");
+        var artifacts = new List<PipelineArtifact>
+        {
+            new("fused.ply", "application/octet-stream", bytes, ArtifactType.DensePointCloud, JsonSerializer.Serialize(new { format = "ply" }, ReconJson.Defaults))
+        };
+
+        var visibilityPackageBytes = await TryCreateDenseVisibilityPackageAsync(workspace.DenseRoot, denseSparseTextRoot, ct);
+        if (visibilityPackageBytes is not null)
+        {
+            artifacts.Add(new PipelineArtifact(
+                "dense-visibility-package.zip",
+                "application/zip",
+                visibilityPackageBytes,
+                ArtifactType.DenseVisibilityPackage,
+                JsonSerializer.Serialize(new
+                {
+                    format = "colmap-dense-visibility",
+                    sparseText = true,
+                    depthMaps = "stereo/depth_maps"
+                }, ReconJson.Defaults)));
+        }
+
+        return new PipelineExecutionResult(true, SerializeReport(PipelineStage.Dense, workspace, commands, new
+        {
+            fusedPath,
+            sparseArtifactRunId = sparseArtifact.Artifact.PipelineRunId,
+            denseVisibilityPackageCreated = visibilityPackageBytes is not null
+        }), artifacts);
     }
 
     public async Task<PipelineExecutionResult> RunExportAsync(ProjectPipelineContext context, CancellationToken ct)
@@ -205,6 +239,7 @@ public sealed class ColmapProjectPipelineService(
         var sceneId = $"run-{context.Run.Id:N}";
 
         var denseArtifact = await GetArtifactContentAsync(context.Project.Id, context.Run.Id, ArtifactType.DensePointCloud, ct);
+        EnsurePlyContainsFiniteVertexPositions(denseArtifact.Bytes, "Dense point cloud artifact is unusable for octree publish.");
         await File.WriteAllBytesAsync(fusedPath, denseArtifact.Bytes, ct);
 
         var command = BuildOctreeBuildCommand(fusedPath, sceneRoot, automationResponsePath, sceneId);
@@ -301,16 +336,74 @@ public sealed class ColmapProjectPipelineService(
         return await RunRequiredProcessAsync(_options.ColmapBinaryPath, arguments, workingDirectory, "COLMAP", ct);
     }
 
+    private async Task<DensePatchMatchResult> RunDensePatchMatchStereoAsync(ColmapWorkspace workspace, CancellationToken ct)
+    {
+        var attemptedSizes = new HashSet<int>();
+        var commands = new List<ProcessExecutionResult>();
+        var maxImageSizes = new List<int?>();
+        var configuredMaxImageSize = NormalizeMaxImageSize(_options.ColmapDenseMaxImageSize);
+        maxImageSizes.Add(configuredMaxImageSize);
+
+        var retryMaxImageSize = NormalizeMaxImageSize(_options.ColmapDenseRetryMaxImageSize);
+        if (_options.ColmapDenseRetryOnCudaFailure
+            && retryMaxImageSize.HasValue
+            && retryMaxImageSize != configuredMaxImageSize
+            && (!configuredMaxImageSize.HasValue || retryMaxImageSize.Value < configuredMaxImageSize.Value))
+        {
+            maxImageSizes.Add(retryMaxImageSize);
+        }
+
+        for (var attemptIndex = 0; attemptIndex < maxImageSizes.Count; attemptIndex++)
+        {
+            var maxImageSize = maxImageSizes[attemptIndex];
+            var arguments = BuildPatchMatchStereoArguments(workspace.DenseRoot, maxImageSize);
+            var result = await RunColmapAsync(arguments, workspace.WorkRoot, ct);
+            commands.Add(result);
+            if (result.ExitCode == 0)
+            {
+                return new DensePatchMatchResult(commands, maxImageSize);
+            }
+
+            var canRetry = attemptIndex < maxImageSizes.Count - 1
+                && IsDenseCudaFailure(result.StandardError);
+            if (!canRetry)
+            {
+                throw new InvalidOperationException($"COLMAP command failed with exit code {result.ExitCode}: {result.StandardError}");
+            }
+
+            var nextMaxImageSize = maxImageSizes[attemptIndex + 1];
+            if (nextMaxImageSize.HasValue && !attemptedSizes.Add(nextMaxImageSize.Value))
+            {
+                throw new InvalidOperationException($"COLMAP command failed with exit code {result.ExitCode}: {result.StandardError}");
+            }
+
+            ResetDenseStereoOutputs(workspace.DenseRoot);
+            logger.LogWarning(
+                "COLMAP dense stereo failed with a CUDA memory error. Retrying with PatchMatchStereo.max_image_size={MaxImageSize}.",
+                nextMaxImageSize);
+        }
+
+        throw new InvalidOperationException("COLMAP dense stereo failed without producing a retryable result.");
+    }
+
     private async Task<ProcessExecutionResult> RunRequiredProcessAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, string toolName, CancellationToken ct)
     {
-        logger.LogInformation("Running process {Command} {Arguments}", fileName, string.Join(' ', arguments));
-        var result = await processRunner.RunAsync(fileName, arguments, workingDirectory, ct);
+        var result = await RunProcessAsync(fileName, arguments, workingDirectory, ct);
         if (result.ExitCode != 0)
         {
             throw new InvalidOperationException($"{toolName} command failed with exit code {result.ExitCode}: {result.StandardError}");
         }
 
         return result;
+    }
+
+    private async Task<ProcessExecutionResult> RunColmapAsync(IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+        => await RunProcessAsync(_options.ColmapBinaryPath, arguments, workingDirectory, ct);
+
+    private async Task<ProcessExecutionResult> RunProcessAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+    {
+        logger.LogInformation("Running process {Command} {Arguments}", fileName, string.Join(' ', arguments));
+        return await processRunner.RunAsync(fileName, arguments, workingDirectory, ct);
     }
 
     private static string ResolveMatcherCommand(string? configJson)
@@ -346,6 +439,298 @@ public sealed class ColmapProjectPipelineService(
         return directory ?? throw new DirectoryNotFoundException("COLMAP did not produce a sparse model directory.");
     }
 
+    private static IReadOnlyCollection<string> BuildPatchMatchStereoArguments(string denseRoot, int? maxImageSize)
+    {
+        var arguments = new List<string>
+        {
+            "patch_match_stereo",
+            "--workspace_path", denseRoot,
+            "--workspace_format", "COLMAP",
+            "--PatchMatchStereo.geom_consistency", "1"
+        };
+
+        if (maxImageSize.HasValue)
+        {
+            arguments.Add("--PatchMatchStereo.max_image_size");
+            arguments.Add(maxImageSize.Value.ToString());
+        }
+
+        return arguments;
+    }
+
+    private static IReadOnlyCollection<string> BuildStereoFusionOptions(int? maxImageSize)
+    {
+        if (!maxImageSize.HasValue)
+        {
+            return [];
+        }
+
+        return
+        [
+            "--StereoFusion.max_image_size",
+            maxImageSize.Value.ToString()
+        ];
+    }
+
+    private static int? NormalizeMaxImageSize(int value) => value > 0 ? value : null;
+
+    private static bool IsDenseCudaFailure(string standardError)
+        => standardError.Contains("CUDA error", StringComparison.OrdinalIgnoreCase)
+            && (standardError.Contains("illegal memory access", StringComparison.OrdinalIgnoreCase)
+                || standardError.Contains("graphics card timeout detection mechanism", StringComparison.OrdinalIgnoreCase));
+
+    private static void ResetDenseStereoOutputs(string denseRoot)
+    {
+        var stereoRoot = Path.Combine(denseRoot, "stereo");
+        foreach (var directoryName in new[] { "depth_maps", "normal_maps", "consistency_graphs" })
+        {
+            var directoryPath = Path.Combine(stereoRoot, directoryName);
+            if (Directory.Exists(directoryPath))
+            {
+                Directory.Delete(directoryPath, recursive: true);
+            }
+        }
+    }
+
+    private static void EnsurePlyContainsFiniteVertexPositions(byte[] bytes, string failurePrefix)
+    {
+        var header = ParsePlyHeader(bytes);
+        var hasFinitePoint = header.Format switch
+        {
+            "ascii" => AsciiPlyContainsFiniteVertexPositions(bytes.AsSpan(header.BodyOffset), header),
+            "binary_little_endian" => BinaryPlyContainsFiniteVertexPositions(bytes.AsSpan(header.BodyOffset), header),
+            _ => throw new InvalidDataException($"{failurePrefix} Unsupported PLY format '{header.Format}'.")
+        };
+
+        if (!hasFinitePoint)
+        {
+            throw new InvalidDataException($"{failurePrefix} PLY did not contain any finite x/y/z vertex positions.");
+        }
+    }
+
+    private static bool AsciiPlyContainsFiniteVertexPositions(ReadOnlySpan<byte> body, PlyHeader header)
+    {
+        var text = Encoding.ASCII.GetString(body);
+        var lines = text.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length < header.VertexCount)
+        {
+            throw new InvalidDataException("ASCII PLY body ended before all vertex rows were read.");
+        }
+
+        for (var i = 0; i < header.VertexCount; i++)
+        {
+            var tokens = lines[i].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length < header.VertexProperties.Count)
+            {
+                throw new InvalidDataException($"ASCII PLY vertex row {i} has too few columns.");
+            }
+
+            var x = ParseAsciiValue(tokens[header.XPropertyIndex], header.VertexProperties[header.XPropertyIndex].Type);
+            var y = ParseAsciiValue(tokens[header.YPropertyIndex], header.VertexProperties[header.YPropertyIndex].Type);
+            var z = ParseAsciiValue(tokens[header.ZPropertyIndex], header.VertexProperties[header.ZPropertyIndex].Type);
+            if (double.IsFinite(x) && double.IsFinite(y) && double.IsFinite(z))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool BinaryPlyContainsFiniteVertexPositions(ReadOnlySpan<byte> body, PlyHeader header)
+    {
+        using var stream = new MemoryStream(body.ToArray(), writable: false);
+        using var reader = new BinaryReader(stream, Encoding.ASCII, leaveOpen: false);
+
+        for (var i = 0; i < header.VertexCount; i++)
+        {
+            double x = 0;
+            double y = 0;
+            double z = 0;
+            for (var propertyIndex = 0; propertyIndex < header.VertexProperties.Count; propertyIndex++)
+            {
+                var value = ReadBinaryValue(reader, header.VertexProperties[propertyIndex].Type);
+                if (propertyIndex == header.XPropertyIndex)
+                {
+                    x = value;
+                }
+                else if (propertyIndex == header.YPropertyIndex)
+                {
+                    y = value;
+                }
+                else if (propertyIndex == header.ZPropertyIndex)
+                {
+                    z = value;
+                }
+            }
+
+            if (double.IsFinite(x) && double.IsFinite(y) && double.IsFinite(z))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static PlyHeader ParsePlyHeader(ReadOnlySpan<byte> buffer)
+    {
+        var marker = Encoding.ASCII.GetBytes("end_header");
+        var markerIndex = buffer.IndexOf(marker);
+        if (markerIndex < 0)
+        {
+            throw new InvalidDataException("PLY header is missing end_header.");
+        }
+
+        var bodyOffset = markerIndex + marker.Length;
+        if (bodyOffset < buffer.Length && buffer[bodyOffset] == (byte)'\r')
+        {
+            bodyOffset++;
+        }
+
+        if (bodyOffset < buffer.Length && buffer[bodyOffset] == (byte)'\n')
+        {
+            bodyOffset++;
+        }
+
+        var headerText = Encoding.ASCII.GetString(buffer[..markerIndex]);
+        var lines = headerText.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(static line => line.TrimEnd('\r'))
+            .ToArray();
+
+        if (lines.Length == 0 || !string.Equals(lines[0], "ply", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("Input is not a valid PLY file.");
+        }
+
+        var format = string.Empty;
+        var vertexCount = -1;
+        var vertexProperties = new List<PlyProperty>();
+        var currentElement = string.Empty;
+
+        foreach (var line in lines.Skip(1))
+        {
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0)
+            {
+                continue;
+            }
+
+            switch (parts[0])
+            {
+                case "comment":
+                    continue;
+                case "format":
+                    if (parts.Length < 2)
+                    {
+                        throw new InvalidDataException("PLY format line is malformed.");
+                    }
+
+                    format = parts[1];
+                    if (!string.Equals(format, "ascii", StringComparison.Ordinal) &&
+                        !string.Equals(format, "binary_little_endian", StringComparison.Ordinal))
+                    {
+                        throw new InvalidDataException($"Unsupported PLY format '{format}'.");
+                    }
+
+                    break;
+                case "element":
+                    if (parts.Length < 3)
+                    {
+                        throw new InvalidDataException("PLY element line is malformed.");
+                    }
+
+                    currentElement = parts[1];
+                    if (string.Equals(currentElement, "vertex", StringComparison.Ordinal))
+                    {
+                        vertexCount = int.Parse(parts[2], CultureInfo.InvariantCulture);
+                    }
+
+                    break;
+                case "property":
+                    if (!string.Equals(currentElement, "vertex", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (parts.Length >= 2 && string.Equals(parts[1], "list", StringComparison.Ordinal))
+                    {
+                        throw new InvalidDataException("PLY vertex list properties are not supported.");
+                    }
+
+                    if (parts.Length < 3 || !IsSupportedPlyNumericType(parts[1]))
+                    {
+                        throw new InvalidDataException("PLY vertex property definition is malformed or unsupported.");
+                    }
+
+                    vertexProperties.Add(new PlyProperty(parts[2], parts[1]));
+                    break;
+            }
+        }
+
+        if (vertexCount < 0)
+        {
+            throw new InvalidDataException("PLY header did not define a vertex element.");
+        }
+
+        var xPropertyIndex = FindVertexPropertyIndex(vertexProperties, "x");
+        var yPropertyIndex = FindVertexPropertyIndex(vertexProperties, "y");
+        var zPropertyIndex = FindVertexPropertyIndex(vertexProperties, "z");
+
+        return new PlyHeader(format, vertexCount, bodyOffset, vertexProperties, xPropertyIndex, yPropertyIndex, zPropertyIndex);
+    }
+
+    private static int FindVertexPropertyIndex(IReadOnlyList<PlyProperty> properties, string name)
+    {
+        var index = properties
+            .Select((property, i) => new { property, i })
+            .FirstOrDefault(x => string.Equals(x.property.Name, name, StringComparison.Ordinal))?.i ?? -1;
+        if (index < 0)
+        {
+            throw new InvalidDataException($"PLY vertex element is missing required '{name}' property.");
+        }
+
+        return index;
+    }
+
+    private static bool IsSupportedPlyNumericType(string type)
+        => type is "char" or "uchar" or "int8" or "uint8" or "short" or "ushort" or "int16" or "uint16"
+            or "int" or "uint" or "int32" or "uint32" or "float" or "float32" or "double" or "float64";
+
+    private static double ParseAsciiValue(string token, string type)
+    {
+        try
+        {
+            return type switch
+            {
+                "float" or "float32" or "double" or "float64" => double.Parse(token, CultureInfo.InvariantCulture),
+                _ => long.Parse(token, CultureInfo.InvariantCulture)
+            };
+        }
+        catch (FormatException ex)
+        {
+            throw new InvalidDataException($"PLY numeric value '{token}' could not be parsed as {type}.", ex);
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException($"PLY numeric value '{token}' overflowed {type}.", ex);
+        }
+    }
+
+    private static double ReadBinaryValue(BinaryReader reader, string type)
+        => type switch
+        {
+            "char" or "int8" => reader.ReadSByte(),
+            "uchar" or "uint8" => reader.ReadByte(),
+            "short" or "int16" => reader.ReadInt16(),
+            "ushort" or "uint16" => reader.ReadUInt16(),
+            "int" or "int32" => reader.ReadInt32(),
+            "uint" or "uint32" => reader.ReadUInt32(),
+            "float" or "float32" => reader.ReadSingle(),
+            "double" or "float64" => reader.ReadDouble(),
+            _ => throw new InvalidDataException($"Unsupported PLY numeric type '{type}'.")
+        };
+
     private static byte[] ZipDirectory(string sourceDirectory)
     {
         var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.zip");
@@ -366,6 +751,51 @@ public sealed class ColmapProjectPipelineService(
                 File.Delete(tempFile);
             }
         }
+    }
+
+    private static async Task<byte[]?> TryCreateDenseVisibilityPackageAsync(string denseRoot, string denseSparseTextRoot, CancellationToken ct)
+    {
+        var camerasPath = Path.Combine(denseSparseTextRoot, "cameras.txt");
+        var imagesPath = Path.Combine(denseSparseTextRoot, "images.txt");
+        var depthMapsRoot = Path.Combine(denseRoot, "stereo", "depth_maps");
+        if (!File.Exists(camerasPath) || !File.Exists(imagesPath) || !Directory.Exists(depthMapsRoot))
+        {
+            return null;
+        }
+
+        var depthMapFiles = Directory.GetFiles(depthMapsRoot, "*.bin", SearchOption.TopDirectoryOnly)
+            .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (depthMapFiles.Length == 0)
+        {
+            return null;
+        }
+
+        using var memory = new MemoryStream();
+        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            await AddFileToArchiveAsync(archive, camerasPath, "sparse/cameras.txt", ct);
+            await AddFileToArchiveAsync(archive, imagesPath, "sparse/images.txt", ct);
+
+            foreach (var depthMapFile in depthMapFiles)
+            {
+                await AddFileToArchiveAsync(
+                    archive,
+                    depthMapFile,
+                    $"stereo/depth_maps/{Path.GetFileName(depthMapFile)}",
+                    ct);
+            }
+        }
+
+        return memory.ToArray();
+    }
+
+    private static async Task AddFileToArchiveAsync(ZipArchive archive, string sourcePath, string entryPath, CancellationToken ct)
+    {
+        var entry = archive.CreateEntry(entryPath, CompressionLevel.Fastest);
+        await using var sourceStream = File.OpenRead(sourcePath);
+        await using var entryStream = entry.Open();
+        await sourceStream.CopyToAsync(entryStream, ct);
     }
 
     private (string FileName, IReadOnlyCollection<string> Arguments) BuildOctreeBuildCommand(string inputPath, string outputPath, string resultJsonPath, string sceneId)
@@ -449,4 +879,7 @@ public sealed class ColmapProjectPipelineService(
 
     private sealed record ColmapWorkspace(string WorkRoot, string ImagesDirectory, string SparseRoot, string DenseRoot);
     private sealed record ResolvedArtifactContent(Artifact Artifact, byte[] Bytes);
+    private sealed record DensePatchMatchResult(IReadOnlyCollection<ProcessExecutionResult> Commands, int? MaxImageSize);
+    private sealed record PlyHeader(string Format, int VertexCount, int BodyOffset, IReadOnlyList<PlyProperty> VertexProperties, int XPropertyIndex, int YPropertyIndex, int ZPropertyIndex);
+    private sealed record PlyProperty(string Name, string Type);
 }

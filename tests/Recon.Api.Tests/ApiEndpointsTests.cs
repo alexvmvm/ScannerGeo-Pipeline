@@ -220,6 +220,72 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
     }
 
     [Fact]
+    public async Task ImagesForPointQuery_ReturnsProjectedMatches()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Projection Query Project");
+        var runId = await SeedProjectionExportAsync(project.Id);
+
+        var response = await client.PostAsJsonAsync($"/api/v1/projects/{project.Id}/query/images-for-point", new
+        {
+            point = new { x = 0.0, y = 0.0, z = 10.0 },
+            maxResults = 10,
+            runId,
+            includeImageUrls = true
+        });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        var payload = await response.Content.ReadFromJsonAsync<ImagesForPointPayload>(_jsonOptions);
+        Assert.NotNull(payload);
+        Assert.Equal(runId, payload!.RunId);
+        Assert.Equal(2, payload.MatchCount);
+        Assert.Equal(500d, payload.Matches.First().U);
+        Assert.Contains("/content", payload.Matches.First().ImageUrl ?? string.Empty);
+    }
+
+    [Fact]
+    public async Task ImagesForPointQuery_ReturnsBadRequestForInvalidInput()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Projection Query Invalid");
+
+        var response = await client.PostAsJsonAsync($"/api/v1/projects/{project.Id}/query/images-for-point", new
+        {
+            point = new { x = 0.0, y = 0.0, z = 10.0 },
+            maxResults = 0
+        });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.BadRequest);
+    }
+
+    [Fact]
+    public async Task ImagesForPointQuery_ReturnsNotFoundForMissingProject()
+    {
+        var client = factory.CreateClient();
+
+        var response = await client.PostAsJsonAsync($"/api/v1/projects/{Guid.NewGuid()}/query/images-for-point", new
+        {
+            point = new { x = 0.0, y = 0.0, z = 10.0 }
+        });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.NotFound);
+    }
+
+    [Fact]
+    public async Task ImagesForPointQuery_ReturnsConflictWhenNoUsableRunExists()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Projection Query Conflict");
+
+        var response = await client.PostAsJsonAsync($"/api/v1/projects/{project.Id}/query/images-for-point", new
+        {
+            point = new { x = 0.0, y = 0.0, z = 10.0 }
+        });
+
+        response.StatusCode.ShouldBe(HttpStatusCode.Conflict);
+    }
+
+    [Fact]
     public async Task OctreeViewerPage_IsServed()
     {
         var client = factory.CreateClient();
@@ -246,6 +312,34 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         var body = await response.Content.ReadAsStringAsync();
         Assert.Contains("\"sceneId\":\"test-scene\"", body);
         Assert.Contains("\"rootNodeId\":\"r\"", body);
+    }
+
+    [Fact]
+    public async Task ListArtifacts_NormalizesLegacyOctreeArtifactType()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Legacy Octree Artifact Project");
+        var artifactId = await SeedOctreeArtifactAsync(project.Id, (ArtifactType)9);
+
+        var artifacts = await client.GetFromJsonAsync<ArtifactPayload[]>($"/api/v1/projects/{project.Id}/artifacts", _jsonOptions);
+
+        var artifact = Assert.Single(artifacts!, x => x.Id == artifactId);
+        Assert.Equal("OctreePackage", artifact.Type);
+    }
+
+    [Fact]
+    public async Task OctreeSceneEntryEndpoint_ReturnsManifestFromLegacyStoredPackage()
+    {
+        var client = factory.CreateClient();
+        var project = await CreateProjectAsync(client, "Legacy Octree Viewer Project");
+        var artifactId = await SeedOctreeArtifactAsync(project.Id, (ArtifactType)9);
+
+        var response = await client.GetAsync($"/api/v1/projects/{project.Id}/artifacts/{artifactId}/scene/manifest.json");
+
+        response.StatusCode.ShouldBe(HttpStatusCode.OK);
+        response.Content.Headers.ContentType?.MediaType.ShouldBe("application/json");
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("\"sceneId\":\"test-scene\"", body);
     }
 
     [Fact]
@@ -358,7 +452,7 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         await db.SaveChangesAsync();
     }
 
-    private async Task<Guid> SeedOctreeArtifactAsync(Guid projectId)
+    private async Task<Guid> SeedOctreeArtifactAsync(Guid projectId, ArtifactType storedType = ArtifactType.OctreePackage)
     {
         using var scope = factory.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<ReconDbContext>();
@@ -376,7 +470,7 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         {
             Id = artifactId,
             ProjectId = projectId,
-            Type = ArtifactType.OctreePackage,
+            Type = storedType,
             Status = ArtifactStatus.Available,
             StorageKey = storageKey,
             FileName = "octree-scene-package.zip",
@@ -388,6 +482,90 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
 
         await db.SaveChangesAsync();
         return artifactId;
+    }
+
+    private async Task<Guid> SeedProjectionExportAsync(Guid projectId)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ReconDbContext>();
+        var objectStorage = scope.ServiceProvider.GetRequiredService<IObjectStorage>();
+        var runId = Guid.NewGuid();
+        var centerImageId = Guid.NewGuid();
+        var edgeImageId = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+        var storageKey = $"projects/{projectId}/runs/{runId}/export/export-package.zip";
+
+        db.PipelineRuns.Add(new PipelineRun
+        {
+            Id = runId,
+            ProjectId = projectId,
+            Status = PipelineRunStatus.Succeeded,
+            PipelineVersion = "colmap-octree",
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            StartedAtUtc = now,
+            FinishedAtUtc = now
+        });
+
+        db.ProjectImages.AddRange(
+            new ProjectImage
+            {
+                Id = centerImageId,
+                ProjectId = projectId,
+                OriginalFileName = "center.jpg",
+                StorageKey = $"projects/{projectId}/images/{centerImageId}/original/center.jpg",
+                SourceType = "upload",
+                MimeType = "image/jpeg",
+                FileSizeBytes = 100,
+                Width = 1000,
+                Height = 1000,
+                Sha256 = Guid.NewGuid().ToString("N"),
+                IsValidImage = true,
+                ValidationStatus = "Validated",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            },
+            new ProjectImage
+            {
+                Id = edgeImageId,
+                ProjectId = projectId,
+                OriginalFileName = "edge.jpg",
+                StorageKey = $"projects/{projectId}/images/{edgeImageId}/original/edge.jpg",
+                SourceType = "upload",
+                MimeType = "image/jpeg",
+                FileSizeBytes = 100,
+                Width = 1000,
+                Height = 1000,
+                Sha256 = Guid.NewGuid().ToString("N"),
+                IsValidImage = true,
+                ValidationStatus = "Validated",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            });
+
+        await using (var zipStream = new MemoryStream(CreateProjectionExportPackageBytes(centerImageId, edgeImageId)))
+        {
+            await objectStorage.SaveAsync(storageKey, zipStream, "application/zip", CancellationToken.None);
+        }
+
+        db.Artifacts.Add(new Artifact
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = projectId,
+            PipelineRunId = runId,
+            Type = ArtifactType.ExportPackage,
+            Status = ArtifactStatus.Available,
+            StorageKey = storageKey,
+            FileName = "export-package.zip",
+            MimeType = "application/zip",
+            FileSizeBytes = 0,
+            MetadataJson = "{\"format\":\"colmap-text-export\"}",
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now
+        });
+
+        await db.SaveChangesAsync();
+        return runId;
     }
 
     private static byte[] TinyPngBytes()
@@ -439,6 +617,33 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
         return memory.ToArray();
     }
 
+    private static byte[] CreateProjectionExportPackageBytes(Guid centerImageId, Guid edgeImageId)
+    {
+        using var memory = new MemoryStream();
+        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            var camerasEntry = archive.CreateEntry("export/cameras.txt");
+            using (var writer = new StreamWriter(camerasEntry.Open()))
+            {
+                writer.WriteLine("# Camera list");
+                writer.WriteLine("1 PINHOLE 1000 1000 1000 1000 500 500");
+                writer.WriteLine("2 PINHOLE 1000 1000 1000 1000 500 500");
+            }
+
+            var imagesEntry = archive.CreateEntry("export/images.txt");
+            using (var writer = new StreamWriter(imagesEntry.Open()))
+            {
+                writer.WriteLine("# Image list");
+                writer.WriteLine($"1 1 0 0 0 0 0 0 1 {centerImageId:N}_center.jpg");
+                writer.WriteLine();
+                writer.WriteLine($"2 1 0 0 0 4 0 0 2 {edgeImageId:N}_edge.jpg");
+                writer.WriteLine();
+            }
+        }
+
+        return memory.ToArray();
+    }
+
     private sealed record ProjectPayload(Guid Id, string Name, string Status);
     private sealed record ProjectListItemPayload(Guid Id, string Name);
     private sealed record PagedPayload<T>(IReadOnlyCollection<T> Items);
@@ -446,6 +651,9 @@ public sealed class ApiEndpointsTests(TestWebApplicationFactory factory) : IClas
     private sealed record ProjectImagePayload(Guid Id, string OriginalFileName);
     private sealed record ImportBatchPayload(Guid Id, string Status, int RequestedCount);
     private sealed record PipelineRunPayload(Guid Id, string Status);
+    private sealed record ArtifactPayload(Guid Id, string Type);
+    private sealed record ImagesForPointPayload(Guid RunId, int MatchCount, IReadOnlyCollection<ImagePointMatchPayload> Matches);
+    private sealed record ImagePointMatchPayload(Guid ImageId, double U, string? ImageUrl);
     private sealed record JobPayload(Guid Id, string Type, string Status);
     private sealed record JobDetailsPayload(Guid Id, string Type, string Status, int AttemptCount, string InputJson, string? OutputJson);
     private sealed record ProcessSelectedJobPayload(bool Handled, JobDetailsPayload Job);

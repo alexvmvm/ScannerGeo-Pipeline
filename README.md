@@ -77,6 +77,9 @@ Important `Recon` settings:
 - `PipelineProvider`: `Simulated` or `Colmap`
 - `ColmapBinaryPath`: path to the `colmap` executable
 - `ColmapUseGpu`: enables COLMAP GPU flags when `true`
+- `ColmapDenseMaxImageSize`: optional cap for dense stereo/fusion image size (`0` leaves COLMAP uncapped)
+- `ColmapDenseRetryOnCudaFailure`: retries dense stereo once with a smaller image size after a CUDA illegal-memory-access/timeout failure
+- `ColmapDenseRetryMaxImageSize`: fallback image-size cap used by that retry
 - `OctreeCliPath`: path to a published `OctreeBuild.Cli.dll` or native `octree-build` executable
 - `OctreeCliProjectPath`: optional source-project fallback for local development when invoking the octree CLI via `dotnet run`
 - `ObjectStorageProvider`: `Minio` or `FileSystem`

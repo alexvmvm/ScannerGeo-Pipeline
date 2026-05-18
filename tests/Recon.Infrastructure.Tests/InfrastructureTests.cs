@@ -9,6 +9,7 @@ using Recon.Core;
 using Recon.Domain;
 using Recon.Infrastructure;
 using System.IO.Compression;
+using System.Text;
 using System.Text.Json;
 
 namespace Recon.Infrastructure.Tests;
@@ -295,7 +296,8 @@ public sealed class InfrastructureTests
 
             var storage = new FileSystemObjectStorage(Options.Create(new ReconOptions { StorageRootPath = storageRoot }));
             const string denseKey = "projects/test/runs/test/dense/fused.ply";
-            await storage.SaveAsync(denseKey, new MemoryStream("ply\nend_header\n"u8.ToArray()), "application/octet-stream", CancellationToken.None);
+            var validPlyBytes = CreateValidAsciiPlyBytes();
+            await storage.SaveAsync(denseKey, new MemoryStream(validPlyBytes, writable: false), "application/octet-stream", CancellationToken.None);
 
             db.Artifacts.Add(new Artifact
             {
@@ -307,7 +309,7 @@ public sealed class InfrastructureTests
                 StorageKey = denseKey,
                 FileName = "fused.ply",
                 MimeType = "application/octet-stream",
-                FileSizeBytes = 15,
+                FileSizeBytes = validPlyBytes.LongLength,
                 CreatedAtUtc = DateTimeOffset.UtcNow,
                 UpdatedAtUtc = DateTimeOffset.UtcNow
             });
@@ -354,10 +356,247 @@ public sealed class InfrastructureTests
         }
     }
 
+    [Fact]
+    public async Task ColmapPipeline_DenseStage_RetriesPatchMatchStereoWithReducedImageSize_OnCudaIllegalMemoryAccess()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = new ReconDbContext(new DbContextOptionsBuilder<ReconDbContext>().UseSqlite(connection).Options);
+        await db.Database.EnsureCreatedAsync();
+
+        var root = Path.Combine(Path.GetTempPath(), "recon-dense-retry-tests", Guid.NewGuid().ToString("N"));
+        var storageRoot = Path.Combine(root, "storage");
+        var scratchRoot = Path.Combine(root, "scratch");
+        Directory.CreateDirectory(storageRoot);
+        Directory.CreateDirectory(scratchRoot);
+
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var project = new Project
+            {
+                Id = Guid.NewGuid(),
+                Name = "Italy - Powerline",
+                Status = ProjectStatus.ReadyForProcessing,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+            var run = new PipelineRun
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                Status = PipelineRunStatus.Running,
+                PipelineVersion = "colmap-octree",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+
+            db.Projects.Add(project);
+            db.PipelineRuns.Add(run);
+
+            var storage = new FileSystemObjectStorage(Options.Create(new ReconOptions { StorageRootPath = storageRoot }));
+            var image = new ProjectImage
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                OriginalFileName = "frame-01.jpg",
+                StorageKey = "projects/test/images/frame-01.jpg",
+                SourceType = "upload",
+                MimeType = "image/jpeg",
+                FileSizeBytes = 3,
+                IsValidImage = true,
+                ValidationStatus = "Validated",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+            await storage.SaveAsync(image.StorageKey, new MemoryStream([1, 2, 3]), image.MimeType, CancellationToken.None);
+
+            var sparseKey = "projects/test/runs/test/sparse/sparse-model.zip";
+            var sparseZipBytes = CreateSparseModelZip();
+            await storage.SaveAsync(sparseKey, new MemoryStream(sparseZipBytes, writable: false), "application/zip", CancellationToken.None);
+
+            db.Artifacts.Add(new Artifact
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                PipelineRunId = run.Id,
+                Type = ArtifactType.SparseModel,
+                Status = ArtifactStatus.Available,
+                StorageKey = sparseKey,
+                FileName = "sparse-model.zip",
+                MimeType = "application/zip",
+                FileSizeBytes = sparseZipBytes.LongLength,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            });
+            await db.SaveChangesAsync();
+
+            var runner = new DenseRetryProcessRunner();
+            var pipeline = new ColmapProjectPipelineService(
+                storage,
+                db,
+                runner,
+                Options.Create(new ReconOptions
+                {
+                    ScratchRootPath = scratchRoot,
+                    ColmapBinaryPath = "colmap",
+                    ColmapDenseRetryOnCudaFailure = true,
+                    ColmapDenseRetryMaxImageSize = 4096
+                }),
+                NullLogger<ColmapProjectPipelineService>.Instance);
+
+            var result = await pipeline.RunDenseAsync(
+                new ProjectPipelineContext(project, run, [image], Path.Combine(scratchRoot, run.Id.ToString("N"))),
+                CancellationToken.None);
+
+            result.Artifacts.Should().HaveCount(2);
+            result.Artifacts.Should().Contain(x => x.ArtifactType == ArtifactType.DensePointCloud);
+            result.Artifacts.Should().Contain(x => x.ArtifactType == ArtifactType.DenseVisibilityPackage);
+            result.ReportJson.Should().Contain("PatchMatchStereo.max_image_size");
+
+            runner.PatchMatchCalls.Should().HaveCount(2);
+            runner.PatchMatchCalls[0].Should().NotContain("4096");
+            runner.PatchMatchCalls[0][Array.IndexOf(runner.PatchMatchCalls[0], "--PatchMatchStereo.geom_consistency") + 1].Should().Be("1");
+            runner.PatchMatchCalls[1].Should().Contain("--PatchMatchStereo.max_image_size");
+            runner.PatchMatchCalls[1].Should().Contain("4096");
+            runner.StereoFusionArguments.Should().Contain("--StereoFusion.max_image_size");
+            runner.StereoFusionArguments.Should().Contain("4096");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ColmapPipeline_PublishFailsEarly_WhenDensePointCloudHasNoFinitePositions()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        await using var db = new ReconDbContext(new DbContextOptionsBuilder<ReconDbContext>().UseSqlite(connection).Options);
+        await db.Database.EnsureCreatedAsync();
+
+        var root = Path.Combine(Path.GetTempPath(), "recon-publish-validation-tests", Guid.NewGuid().ToString("N"));
+        var storageRoot = Path.Combine(root, "storage");
+        var scratchRoot = Path.Combine(root, "scratch");
+        Directory.CreateDirectory(storageRoot);
+        Directory.CreateDirectory(scratchRoot);
+
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var project = new Project
+            {
+                Id = Guid.NewGuid(),
+                Name = "Italy - Powerline",
+                Status = ProjectStatus.ReadyForProcessing,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+            var run = new PipelineRun
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                Status = PipelineRunStatus.Running,
+                PipelineVersion = "colmap-octree",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            };
+
+            db.Projects.Add(project);
+            db.PipelineRuns.Add(run);
+
+            var storage = new FileSystemObjectStorage(Options.Create(new ReconOptions { StorageRootPath = storageRoot }));
+            const string denseKey = "projects/test/runs/test/dense/fused.ply";
+            var invalidPlyBytes = Encoding.ASCII.GetBytes("""
+ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+end_header
+NaN 0 0
+1 Infinity 2
+""");
+            await storage.SaveAsync(denseKey, new MemoryStream(invalidPlyBytes, writable: false), "application/octet-stream", CancellationToken.None);
+
+            db.Artifacts.Add(new Artifact
+            {
+                Id = Guid.NewGuid(),
+                ProjectId = project.Id,
+                PipelineRunId = run.Id,
+                Type = ArtifactType.DensePointCloud,
+                Status = ArtifactStatus.Available,
+                StorageKey = denseKey,
+                FileName = "fused.ply",
+                MimeType = "application/octet-stream",
+                FileSizeBytes = invalidPlyBytes.LongLength,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now
+            });
+            await db.SaveChangesAsync();
+
+            var pipeline = new ColmapProjectPipelineService(
+                storage,
+                db,
+                new RecordingProcessRunner(),
+                Options.Create(new ReconOptions
+                {
+                    ScratchRootPath = scratchRoot,
+                    ColmapBinaryPath = "colmap",
+                    OctreeCliProjectPath = Path.Combine("external", "ScannerGeo-Octree", "src", "OctreeBuild.Cli", "OctreeBuild.Cli.csproj")
+                }),
+                NullLogger<ColmapProjectPipelineService>.Instance);
+
+            var action = () => pipeline.RunPublishAsync(
+                new ProjectPipelineContext(project, run, [], Path.Combine(scratchRoot, run.Id.ToString("N"))),
+                CancellationToken.None);
+
+            await action.Should().ThrowAsync<InvalidDataException>()
+                .WithMessage("*Dense point cloud artifact is unusable for octree publish.*finite x/y/z vertex positions*");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private sealed class StaticClock : IClock
     {
         public DateTimeOffset UtcNow => new(2026, 3, 19, 12, 0, 0, TimeSpan.Zero);
     }
+
+    private static byte[] CreateSparseModelZip()
+    {
+        using var memory = new MemoryStream();
+        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            archive.CreateEntry("0/cameras.txt");
+            archive.CreateEntry("0/images.txt");
+            archive.CreateEntry("0/points3D.txt");
+        }
+
+        return memory.ToArray();
+    }
+
+    private static byte[] CreateValidAsciiPlyBytes()
+        => Encoding.ASCII.GetBytes("""
+ply
+format ascii 1.0
+element vertex 1
+property float x
+property float y
+property float z
+end_header
+1 2 3
+""");
 
     private sealed class RecordingProcessRunner : IProcessRunner
     {
@@ -424,6 +663,73 @@ public sealed class InfrastructureTests
             await File.WriteAllTextAsync(resultJsonPath, response, ct);
 
             return new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero);
+        }
+    }
+
+    private sealed class DenseRetryProcessRunner : IProcessRunner
+    {
+        public List<string[]> PatchMatchCalls { get; } = [];
+        public IReadOnlyCollection<string> StereoFusionArguments { get; private set; } = [];
+
+        public async Task<ProcessExecutionResult> RunAsync(string fileName, IReadOnlyCollection<string> arguments, string workingDirectory, CancellationToken ct)
+        {
+            var args = arguments.ToArray();
+            switch (args[0])
+            {
+                case "image_undistorter":
+                    return new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero);
+                case "model_converter":
+                {
+                    var outputPath = args[Array.IndexOf(args, "--output_path") + 1];
+                    Directory.CreateDirectory(outputPath);
+                    await File.WriteAllTextAsync(Path.Combine(outputPath, "cameras.txt"), "1 PINHOLE 1000 1000 1000 1000 500 500\n", ct);
+                    await File.WriteAllTextAsync(Path.Combine(outputPath, "images.txt"), "1 1 0 0 0 0 0 0 1 frame-01.jpg\n\n", ct);
+                    return new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero);
+                }
+                case "patch_match_stereo":
+                {
+                    PatchMatchCalls.Add(args);
+                    if (PatchMatchCalls.Count == 1)
+                    {
+                        var stereoRoot = Path.Combine(args[Array.IndexOf(args, "--workspace_path") + 1], "stereo");
+                        Directory.CreateDirectory(Path.Combine(stereoRoot, "depth_maps"));
+                        Directory.CreateDirectory(Path.Combine(stereoRoot, "normal_maps"));
+                        Directory.CreateDirectory(Path.Combine(stereoRoot, "consistency_graphs"));
+                        await File.WriteAllTextAsync(Path.Combine(stereoRoot, "depth_maps", "partial.bin"), "partial", ct);
+                        return new ProcessExecutionResult(
+                            fileName,
+                            arguments,
+                            1,
+                            string.Empty,
+                            "CUDA error at /usr/local/src/colmap/src/colmap/mvs/gpu_mat.h:374 - an illegal memory access was encountered\nThis error is likely caused by the graphics card timeout detection mechanism of your operating system.",
+                            TimeSpan.Zero);
+                    }
+
+                    var depthMapsRoot = Path.Combine(args[Array.IndexOf(args, "--workspace_path") + 1], "stereo", "depth_maps");
+                    Directory.CreateDirectory(depthMapsRoot);
+                    await using (var file = File.Create(Path.Combine(depthMapsRoot, "frame-01.jpg.geometric.bin")))
+                    {
+                        var header = Encoding.ASCII.GetBytes("1000&1000&1&");
+                        await file.WriteAsync(header, ct);
+                        var depthBytes = BitConverter.GetBytes(10f);
+                        for (var index = 0; index < 1000 * 1000; index++)
+                        {
+                            await file.WriteAsync(depthBytes, ct);
+                        }
+                    }
+
+                    return new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero);
+                }
+                case "stereo_fusion":
+                {
+                    StereoFusionArguments = args;
+                    var outputPath = args[Array.IndexOf(args, "--output_path") + 1];
+                    await File.WriteAllBytesAsync(outputPath, CreateValidAsciiPlyBytes(), ct);
+                    return new ProcessExecutionResult(fileName, arguments, 0, string.Empty, string.Empty, TimeSpan.Zero);
+                }
+                default:
+                    throw new InvalidOperationException($"Unexpected command '{args[0]}'.");
+            }
         }
     }
 }

@@ -64,20 +64,21 @@ public enum JobType
 
 public enum ArtifactType
 {
-    OriginalImage,
-    Thumbnail,
-    InspectReport,
-    SparseModel,
-    DensePointCloud,
-    DenseReport,
-    SparseReport,
-    ExportReport,
-    OctreePackage,
-    PotreePackage,
-    LogFile,
-    SummaryJson,
-    ExportPackage,
-    PublishReport
+    OriginalImage = 0,
+    Thumbnail = 1,
+    InspectReport = 2,
+    SparseModel = 3,
+    DensePointCloud = 4,
+    DenseReport = 5,
+    SparseReport = 6,
+    ExportReport = 7,
+    OctreePackage = 8,
+    PotreePackage = 9,
+    LogFile = 10,
+    SummaryJson = 11,
+    ExportPackage = 12,
+    PublishReport = 13,
+    DenseVisibilityPackage = 14
 }
 
 public enum ArtifactStatus

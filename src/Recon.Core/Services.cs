@@ -456,11 +456,6 @@ public sealed class ArtifactService(IReconDbContext dbContext, IObjectStorage ob
     public async Task<IReadOnlyCollection<Artifact>> ListArtifactsAsync(Guid projectId, ArtifactQuery query, CancellationToken ct)
     {
         var artifacts = dbContext.Artifacts.AsNoTracking().Where(x => x.ProjectId == projectId);
-        if (query.Type is { } type)
-        {
-            artifacts = artifacts.Where(x => x.Type == type);
-        }
-
         if (query.RunId is { } runId)
         {
             artifacts = artifacts.Where(x => x.PipelineRunId == runId);
@@ -471,7 +466,15 @@ public sealed class ArtifactService(IReconDbContext dbContext, IObjectStorage ob
             artifacts = artifacts.Where(x => x.Status == status);
         }
 
-        return await artifacts.OrderByDescending(x => x.CreatedAtUtc).ToListAsync(ct);
+        var results = (await artifacts.ToListAsync(ct))
+            .OrderByDescending(x => x.CreatedAtUtc)
+            .ToList();
+        if (query.Type is { } type)
+        {
+            results = results.Where(x => ArtifactTypeCompatibility.Matches(x, type)).ToList();
+        }
+
+        return results;
     }
 
     public async Task<(Artifact Artifact, StoredObject Content)> GetArtifactContentAsync(Guid projectId, Guid artifactId, CancellationToken ct)
@@ -492,7 +495,7 @@ public sealed class ArtifactService(IReconDbContext dbContext, IObjectStorage ob
     {
         var normalizedEntryPath = NormalizeSceneEntryPath(entryPath);
         var (artifact, storedObject) = await GetArtifactContentAsync(projectId, artifactId, ct);
-        if (artifact.Type != ArtifactType.OctreePackage)
+        if (!ArtifactTypeCompatibility.Matches(artifact, ArtifactType.OctreePackage))
         {
             throw new NotFoundException($"Artifact '{artifactId}' is not an octree scene package.");
         }
